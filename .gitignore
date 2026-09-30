@@ -7,3 +7,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 package-lock.json
+
+# Local wrangler config (deploy-specific); example template is tracked.
+wrangler.toml
+relay/package-lock.json

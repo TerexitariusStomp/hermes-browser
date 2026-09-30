@@ -712,6 +712,10 @@
     call: substrateCall,
     present: substratePing,
   }
+  // Read-side vault surface for the grants UI and smoke tests — stores and
+  // resolutions still flow through the same worker ops; nothing here hands
+  // raw secret values to page JS (resolve ops return to the worker only).
+  window.__HERMES_VAULT__ = { call: vaultCall }
 
   // --- 6b. WASI runner (in-page cowasm userspace) ---------------------------
   // The runner bundle is lazily imported on first wasi op — it installs

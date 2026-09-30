@@ -4,6 +4,9 @@ import { createReadStream, existsSync, statSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { extname, join } from 'node:path'
 
+const ROOT = process.argv[2] || 'dist'
+const PORT = Number(process.argv[3] || 8471)
+
 const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
   '.json': 'application/json', '.zip': 'application/zip', '.wasm': 'application/wasm',
@@ -81,13 +84,13 @@ function mockLlm(req, res) {
 
 createServer((req, res) => {
   if (mockLlm(req, res)) return
-  let p = join('dist', decodeURIComponent(req.url.split('?')[0]))
+  let p = join(ROOT, decodeURIComponent(req.url.split('?')[0]))
   if (p.endsWith('/')) p += 'index.html'
-  if (!existsSync(p) || statSync(p).isDirectory()) p = 'dist/index.html'
+  if (!existsSync(p) || statSync(p).isDirectory()) p = join(ROOT, 'index.html')
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
   // Embed parity with dist/_headers: the app is frameable by other origins.
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
   res.setHeader('Content-Type', MIME[extname(p)] || 'application/octet-stream')
   createReadStream(p).pipe(res)
-}).listen(8471, () => console.log('serving :8471'))
+}).listen(PORT, () => console.log(`serving ${ROOT} on :${PORT}`))

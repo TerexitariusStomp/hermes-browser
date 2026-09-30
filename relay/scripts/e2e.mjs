@@ -45,7 +45,12 @@ async function main() {
   check('POST /s status', mint.status === 200, `got ${mint.status}`)
   const sess = await mint.json()
   check('mint returns tokens', !!(sess.sid && sess.agentToken && sess.clientToken))
-  check('mint returns stock baseUrl', sess.baseUrl === `${BASE}/s/${sess.sid}`)
+  const bu = new URL(sess.baseUrl)
+  const base = new URL(BASE)
+  check('mint returns stock baseUrl',
+    bu.protocol === base.protocol && bu.hostname === base.hostname &&
+    bu.pathname === `/s/${sess.sid}`,
+    `got ${sess.baseUrl}`)
 
   // 2. client rejected before agent connects
   const early = await fetch(`${BASE}/s/${sess.sid}/api/status`, { headers: { 'x-hermes-session-token': sess.clientToken } })

@@ -131,7 +131,7 @@ export default {
           agentToken,
           clientToken,
           // The stock remote-gateway entry: Desktop takes these verbatim.
-          baseUrl: `${url.origin}/s/${sid}`,
+          baseUrl: `${url.protocol}//${request.headers.get('host')}/s/${sid}`,
           token: clientToken,
           expiresIn: 24 * 3600,
         },

@@ -25,9 +25,12 @@ for (const f of readdirSync(pyodideSrc)) {
 console.log('pyodide assets copied')
 
 // 2. Pure-Python wheels via pip download (py3-none-any / abi3 only).
+// jinja2 is intentionally absent: it depends on markupsafe, which has no
+// py3-none-any wheel — both ship in the Pyodide distribution (step 1) as
+// emscripten-built wheels.
 const PURE_DEPS = [
   'ruamel.yaml', 'openai', 'httpx[socks]', 'python-dotenv', 'tenacity',
-  'tomli-w', 'requests', 'jinja2', 'croniter', 'snowballstemmer',
+  'tomli-w', 'requests', 'croniter', 'snowballstemmer',
   'websockets', 'rich', 'prompt_toolkit', 'fire', 'truststore',
 ]
 const out = execFileSync('python3', [
