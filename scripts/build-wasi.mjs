@@ -5,7 +5,7 @@
 //                           ./browser-worker.js + ../pkg/wasmer_sdk_js.js via
 //                           import.meta.url, so relative layout is preserved)
 //   pkg/                  — @wasmer/sdk wasm-bindgen core (JS + .wasm)
-//   webc/*.webc           — vendored WASIX packages (bash, coreutils, ...)
+//   webc/*.webc           — vendored WASIX packages (assets/wasi) (bash, coreutils, ...)
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join, resolve, dirname } from 'node:path'
@@ -28,7 +28,7 @@ cpSync(join(sdkRoot, 'dist'), join(outDir, 'wasmer'), { recursive: true })
 cpSync(join(sdkRoot, 'pkg'), join(outDir, 'pkg'), { recursive: true })
 
 // Vendored WASIX packages.
-const webcDir = join(root, 'vendor', 'wasi')
+const webcDir = join(root, 'assets', 'wasi')
 if (!existsSync(webcDir)) throw new Error(`missing vendored webc dir: ${webcDir}`)
 const webcs = readdirSync(webcDir).filter((f) => f.endsWith('.webc'))
 if (!webcs.length) throw new Error('no .webc packages in vendor/wasi')

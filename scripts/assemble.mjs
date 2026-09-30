@@ -66,7 +66,7 @@ writeFileSync(join(out, 'manifest.webmanifest'), JSON.stringify({
 
 // wllama (MIT) — in-browser local-model endpoint. The esm build inlines its
 // worker + emscripten glue; only the wasm binary ships separately.
-const wllamaPkg = resolve(root, '../../node_modules/@wllama/wllama/esm')
+const wllamaPkg = resolve(root, 'node_modules/@wllama/wllama/esm')
 try {
   cpSync(join(wllamaPkg, 'index.js'), join(out, 'vendor-wllama.js'))
   mkdirSync(join(out, 'wllama'), { recursive: true })
