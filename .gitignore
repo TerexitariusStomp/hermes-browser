@@ -1,0 +1,9 @@
+.browser-cache/
+dist/
+vendor/
+node_modules/
+.wrangler/
+__pycache__/
+.pytest_cache/
+*.pyc
+package-lock.json

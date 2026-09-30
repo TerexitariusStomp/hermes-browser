@@ -1,0 +1,4 @@
+name: hermes-browser
+version: "0.1.0"
+description: "Browser-runtime substrates for Hermes running under Pyodide: a browser_ext toolset driving real user-browser tabs through the Hermes substrate extension (grant-gated, audited, fixed ops only), and a WASI terminal environment backend for in-browser shell execution."
+author: "TerexitariusStomp"

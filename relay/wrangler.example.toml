@@ -1,0 +1,28 @@
+name = "hermes-relay"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Rendezvous relay for browser-hosted Hermes gateways. The DO holds only
+# in-memory socket state + sha256 token hashes; RPC payloads transit in
+# memory and are never persisted. A compromised relay can drop/mangle
+# frames but cannot mint sessions or reach secrets.
+#
+# Deploy: cp wrangler.example.toml wrangler.toml, set routes/zone + SHARE_ORIGINS.
+
+routes = [{ pattern = "relay.example.com/*", zone_name = "example.com" }]
+
+[[durable_objects.bindings]]
+name = "GW_SESSIONS"
+class_name = "HermesSessionDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["HermesSessionDO"]
+
+[vars]
+# Origins allowed to mint sessions via POST /s (comma-separated).
+SHARE_ORIGINS = "https://hermes.example.com,http://localhost:8471"
+
+[observability]
+enabled = false

@@ -1,0 +1,22 @@
+# Draft entry for the upstream plugin-catalog/ directory
+# (NousResearch/hermes-agent). Submitted as a PR adding this file once the
+# hermes-browser repo is public — `sha` must pin a real 40-hex commit.
+name: hermes-browser
+repo: https://github.com/TerexitariusStomp/hermes-browser
+sha: PIN_40_HEX_COMMIT_HERE
+description: Run Hermes entirely inside a browser tab — upstream agent core
+  under Pyodide in a Web Worker, secrets held in an isolated vault worker,
+  WASI userspace terminal, browser-native capability toolset, in-page local
+  model endpoint, embeddable widget, and a rendezvous relay for stock
+  remote-gateway clients.
+maintainer: TerexitariusStomp
+tier: community
+category: runtime
+requires_hermes: '>=0.20'
+docs_url: https://github.com/TerexitariusStomp/hermes-browser#readme
+version: 0.1.0
+platforms: []
+capabilities:
+  provides_tools: [pwa, browser_ext, local_host]
+  provides_terminal_environments: [wasi, local_host]
+  provides_skills: [local-host]
