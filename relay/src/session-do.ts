@@ -23,7 +23,12 @@
  *                 {t:'end',reason}
  *   agent -> DO:  {t:'ws-opened',cid} {t:'ws-msg',cid,data}
  *                 {t:'ws-close',cid} {t:'rest-res',id,status,headers,bodyB64?}
+ *
+ * Connection plumbing (accept, tags, state, close/error dispatch) is
+ * partyserver's Server; auth gating, the REST bridge, and the frame
+ * protocol above are the session's own contract.
  */
+import { Server, type Connection, type ConnectionContext, type WSMessage } from 'partyserver'
 
 export interface SessionInit {
   agentHash: string
@@ -38,9 +43,12 @@ interface PendingRest {
   timer: ReturnType<typeof setTimeout>
 }
 
-interface WsAttachment {
+interface ConnState {
   role: 'agent' | 'client'
-  cid?: string
+}
+
+interface Env {
+  GW_SESSIONS: DurableObjectNamespace
 }
 
 const MAX_CLIENTS = 16
@@ -81,38 +89,32 @@ function json(status: number, body: unknown): Response {
   })
 }
 
-export class HermesSessionDO implements DurableObject {
-  private state: DurableObjectState
+export class HermesSessionDO extends Server<Env> {
   private pendingRest = new Map<string, PendingRest>()
   // cid -> client messages received before the agent acked ws-open.
   private openQueue = new Map<string, string[]>()
   private init: SessionInit | null = null
 
-  constructor(state: DurableObjectState) {
-    this.state = state
-    this.state.blockConcurrencyWhile(async () => {
-      this.init = (await this.state.storage.get<SessionInit>('init')) ?? null
-    })
+  private async getInit(): Promise<SessionInit | null> {
+    if (!this.init) this.init = (await this.ctx.storage.get<SessionInit>('init')) ?? null
+    return this.init
   }
 
-  private agentWs(): WebSocket | null {
-    const list = this.state.getWebSockets('agent')
-    return list.length ? list[0]! : null
-  }
-
-  private clientWs(cid: string): WebSocket | null {
-    for (const ws of this.state.getWebSockets('client')) {
-      const att = ws.deserializeAttachment() as WsAttachment | null
-      if (att?.cid === cid) return ws
-    }
+  private agentConn(): Connection<ConnState> | null {
+    for (const c of this.getConnections<ConnState>('agent')) return c
     return null
   }
 
+  private clientConn(cid: string): Connection<ConnState> | null {
+    const c = this.getConnection<ConnState>(cid)
+    return c && c.state?.role === 'client' ? c : null
+  }
+
   private sendToAgent(obj: unknown): boolean {
-    const ws = this.agentWs()
-    if (!ws) return false
+    const conn = this.agentConn()
+    if (!conn) return false
     try {
-      ws.send(JSON.stringify(obj))
+      conn.send(JSON.stringify(obj))
       return true
     } catch {
       return false
@@ -124,7 +126,67 @@ export class HermesSessionDO implements DurableObject {
     return (await sha256Hex(token)) === this.init[which]
   }
 
+  /**
+   * Auth gate for ws upgrades, preserving the HTTP contract (401/503/429
+   * before the 101 switch). Partyserver's Server.fetch owns accept/tagging;
+   * non-upgrade requests fall through to onRequest.
+   */
   async fetch(request: Request): Promise<Response> {
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+      return super.fetch(request)
+    }
+    const url = new URL(request.url)
+    const path = url.pathname
+    const init = await this.getInit()
+    if (!init) return json(404, { error: 'unknown_session' })
+    if (Date.now() > init.expiresAt) {
+      this.teardown('expired')
+      return json(410, { error: 'session_expired' })
+    }
+
+    // Agent outbound dial: GET /agent?token=<agentToken> (ws upgrade)
+    if (path === '/agent') {
+      const token = url.searchParams.get('token') || ''
+      if (!(await this.hashOk(token, 'agentHash'))) return json(401, { error: 'bad_token' })
+      // A second agent dial replaces the first (tab reload).
+      const old = this.agentConn()
+      if (old) {
+        try { old.close(1000, 'replaced') } catch { /* already gone */ }
+        this.failAllClients('agent-replaced')
+      }
+      return super.fetch(request)
+    }
+
+    // Stock client ws: GET /api/ws?token=<clientToken>
+    if (path === '/api/ws') {
+      const token = url.searchParams.get('token') || ''
+      if (!(await this.hashOk(token, 'clientHash'))) return json(401, { error: 'bad_token' })
+      if (!this.agentConn()) return json(503, { error: 'agent_not_connected' })
+      if ([...this.getConnections('client')].length >= MAX_CLIENTS) {
+        return json(429, { error: 'too_many_clients' })
+      }
+      return super.fetch(request)
+    }
+
+    return json(404, { error: 'not_found' })
+  }
+
+  /** Tag + role-stamp each accepted socket from the upgrade path. */
+  getConnectionTags(connection: Connection<ConnState>, ctx: ConnectionContext): string[] {
+    const role = new URL(ctx.request.url).pathname === '/agent' ? 'agent' : 'client'
+    connection.setState({ role })
+    return [role]
+  }
+
+  onConnect(connection: Connection<ConnState>): void {
+    if (connection.state?.role !== 'client') return
+    // Messages arriving before the agent acks (ws-opened) queue here.
+    this.openQueue.set(connection.id, [])
+    this.sendToAgent({ t: 'ws-open', cid: connection.id, path: '/api/ws' })
+  }
+
+  /** Non-upgrade surface: init, status, teardown, and the REST bridge. */
+  async onRequest(request: Request): Promise<Response> {
     const url = new URL(request.url)
     const path = url.pathname
 
@@ -133,7 +195,7 @@ export class HermesSessionDO implements DurableObject {
       if (request.headers.get(INTERNAL_HEADER) !== '1') return json(403, { error: 'forbidden' })
       const body = (await request.json().catch(() => null)) as SessionInit | null
       if (!body?.agentHash || !body?.clientHash) return json(400, { error: 'invalid_init' })
-      if (this.init) return json(409, { error: 'already_initialized' })
+      if (await this.getInit()) return json(409, { error: 'already_initialized' })
       this.init = {
         agentHash: body.agentHash,
         clientHash: body.clientHash,
@@ -141,13 +203,14 @@ export class HermesSessionDO implements DurableObject {
         createdAt: body.createdAt || Date.now(),
         expiresAt: body.expiresAt || Date.now() + 24 * 3600 * 1000,
       }
-      await this.state.storage.put('init', this.init)
-      await this.state.storage.setAlarm(this.init.expiresAt)
+      await this.ctx.storage.put('init', this.init)
+      await this.ctx.storage.setAlarm(this.init.expiresAt)
       return json(200, { ok: true })
     }
 
-    if (!this.init) return json(404, { error: 'unknown_session' })
-    if (Date.now() > this.init.expiresAt) {
+    const init = await this.getInit()
+    if (!init) return json(404, { error: 'unknown_session' })
+    if (Date.now() > init.expiresAt) {
       this.teardown('expired')
       return json(410, { error: 'session_expired' })
     }
@@ -156,9 +219,9 @@ export class HermesSessionDO implements DurableObject {
       const token = url.searchParams.get('token') || ''
       if (!(await this.hashOk(token, 'agentHash'))) return json(401, { error: 'bad_token' })
       return json(200, {
-        agentConnected: !!this.agentWs(),
-        clients: this.state.getWebSockets('client').length,
-        expiresAt: this.init.expiresAt,
+        agentConnected: !!this.agentConn(),
+        clients: [...this.getConnections('client')].length,
+        expiresAt: init.expiresAt,
       })
     }
 
@@ -169,45 +232,6 @@ export class HermesSessionDO implements DurableObject {
       return json(200, { ok: true })
     }
 
-    // Agent outbound dial: GET /agent?token=<agentToken> (ws upgrade)
-    if (path === '/agent') {
-      if (request.headers.get('Upgrade') !== 'websocket') return json(426, { error: 'expected_websocket' })
-      const token = url.searchParams.get('token') || ''
-      if (!(await this.hashOk(token, 'agentHash'))) return json(401, { error: 'bad_token' })
-
-      const pair = new WebSocketPair()
-      const [client, server] = Object.values(pair) as [WebSocket, WebSocket]
-      // A second agent dial replaces the first (tab reload).
-      const old = this.agentWs()
-      if (old) {
-        try { old.close(1000, 'replaced') } catch { /* already gone */ }
-        this.failAllClients('agent-replaced')
-      }
-      server.serializeAttachment({ role: 'agent' } satisfies WsAttachment)
-      this.state.acceptWebSocket(server, ['agent'])
-      return new Response(null, { status: 101, webSocket: client })
-    }
-
-    // Stock client ws: GET /api/ws?token=<clientToken>
-    if (path === '/api/ws') {
-      if (request.headers.get('Upgrade') !== 'websocket') return json(426, { error: 'expected_websocket' })
-      const token = url.searchParams.get('token') || ''
-      if (!(await this.hashOk(token, 'clientHash'))) return json(401, { error: 'bad_token' })
-      if (!this.agentWs()) return json(503, { error: 'agent_not_connected' })
-      if (this.state.getWebSockets('client').length >= MAX_CLIENTS) {
-        return json(429, { error: 'too_many_clients' })
-      }
-      const cid = crypto.randomUUID()
-      const pair = new WebSocketPair()
-      const [client, server] = Object.values(pair) as [WebSocket, WebSocket]
-      server.serializeAttachment({ role: 'client', cid } satisfies WsAttachment)
-      this.state.acceptWebSocket(server, ['client'])
-      // Messages arriving before the agent acks (ws-opened) queue here.
-      this.openQueue.set(cid, [])
-      this.sendToAgent({ t: 'ws-open', cid, path: '/api/ws' })
-      return new Response(null, { status: 101, webSocket: client })
-    }
-
     // Stock client REST bridge: ANY /api/* with the client token.
     if (path.startsWith('/api/')) {
       const token =
@@ -216,7 +240,7 @@ export class HermesSessionDO implements DurableObject {
         url.searchParams.get('token') ||
         ''
       if (!(await this.hashOk(token, 'clientHash'))) return json(401, { error: 'bad_token' })
-      if (!this.agentWs()) return json(503, { error: 'agent_not_connected' })
+      if (!this.agentConn()) return json(503, { error: 'agent_not_connected' })
       if (this.pendingRest.size >= MAX_PENDING_REST) return json(429, { error: 'too_many_pending' })
 
       const len = Number(request.headers.get('content-length') || 0)
@@ -270,28 +294,28 @@ export class HermesSessionDO implements DurableObject {
     return json(404, { error: 'not_found' })
   }
 
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    const att = ws.deserializeAttachment() as WsAttachment | null
-    if (!att) return
+  async onMessage(conn: Connection<ConnState>, message: WSMessage): Promise<void> {
+    const role = conn.state?.role
+    if (!role) return
 
-    if (att.role === 'agent') {
+    if (role === 'agent') {
       let m: any
       try {
-        m = JSON.parse(typeof message === 'string' ? message : new TextDecoder().decode(message))
+        m = JSON.parse(typeof message === 'string' ? message : new TextDecoder().decode(message as ArrayBuffer))
       } catch {
         return
       }
       if (m.t === 'ws-opened' && typeof m.cid === 'string') {
         const queued = this.openQueue.get(m.cid)
         this.openQueue.delete(m.cid)
-        const client = this.clientWs(m.cid)
+        const client = this.clientConn(m.cid)
         if (client && queued) {
           for (const data of queued) {
             if (!this.sendToAgent({ t: 'ws-msg', cid: m.cid, data })) break
           }
         }
       } else if (m.t === 'ws-msg' && typeof m.cid === 'string') {
-        const client = this.clientWs(m.cid)
+        const client = this.clientConn(m.cid)
         if (client) {
           try { client.send(m.data) } catch { /* client gone */ }
         } else {
@@ -299,7 +323,7 @@ export class HermesSessionDO implements DurableObject {
           this.sendToAgent({ t: 'ws-close', cid: m.cid, code: 1001, reason: 'client-gone' })
         }
       } else if (m.t === 'ws-close' && typeof m.cid === 'string') {
-        const client = this.clientWs(m.cid)
+        const client = this.clientConn(m.cid)
         if (client) {
           try { client.close(m.code || 1000, String(m.reason || '')) } catch { /* gone */ }
         }
@@ -315,26 +339,26 @@ export class HermesSessionDO implements DurableObject {
     }
 
     // Client socket -> forward payload to the agent.
-    if (att.role === 'client' && att.cid) {
-      const data = typeof message === 'string' ? message : new TextDecoder().decode(message)
+    if (role === 'client') {
+      const cid = conn.id
+      const data = typeof message === 'string' ? message : new TextDecoder().decode(message as ArrayBuffer)
       // Agent hasn't acked the open yet — queue briefly.
-      if (this.openQueue.has(att.cid)) {
-        const q = this.openQueue.get(att.cid)!
+      if (this.openQueue.has(cid)) {
+        const q = this.openQueue.get(cid)!
         if (q.length < MAX_QUEUED_PER_CLIENT) q.push(data)
         return
       }
-      if (!this.sendToAgent({ t: 'ws-msg', cid: att.cid, data })) {
-        try { ws.close(1013, 'agent-gone') } catch { /* gone */ }
+      if (!this.sendToAgent({ t: 'ws-msg', cid, data })) {
+        try { conn.close(1013, 'agent-gone') } catch { /* gone */ }
       }
     }
   }
 
-  async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
-    const att = ws.deserializeAttachment() as WsAttachment | null
-    if (att?.role === 'client' && att.cid) {
-      this.openQueue.delete(att.cid)
-      this.sendToAgent({ t: 'ws-close', cid: att.cid, code, reason })
-    } else if (att?.role === 'agent') {
+  async onClose(conn: Connection<ConnState>, code: number, reason: string): Promise<void> {
+    if (conn.state?.role === 'client') {
+      this.openQueue.delete(conn.id)
+      this.sendToAgent({ t: 'ws-close', cid: conn.id, code, reason })
+    } else if (conn.state?.role === 'agent') {
       // Agent left: every client stream is dead — close them so clients
       // reconnect (and re-open) against a future agent socket.
       this.failAllClients('agent-disconnected')
@@ -346,30 +370,29 @@ export class HermesSessionDO implements DurableObject {
     }
   }
 
-  async webSocketError(ws: WebSocket): Promise<void> {
-    const att = ws.deserializeAttachment() as WsAttachment | null
-    if (att?.role === 'client' && att.cid) {
-      this.sendToAgent({ t: 'ws-close', cid: att.cid, code: 1011, reason: 'client-error' })
+  async onError(conn: Connection<ConnState>): Promise<void> {
+    if (conn.state?.role === 'client') {
+      this.sendToAgent({ t: 'ws-close', cid: conn.id, code: 1011, reason: 'client-error' })
     }
   }
 
-  async alarm(): Promise<void> {
+  async onAlarm(): Promise<void> {
     if (this.init && Date.now() > this.init.expiresAt) {
       this.teardown('expired')
     }
   }
 
   private failAllClients(reason: string): void {
-    for (const ws of this.state.getWebSockets('client')) {
-      try { ws.close(1012, reason) } catch { /* gone */ }
+    for (const conn of this.getConnections('client')) {
+      try { conn.close(1012, reason) } catch { /* gone */ }
     }
     this.openQueue.clear()
   }
 
   private teardown(reason: string): void {
     this.sendToAgent({ t: 'end', reason })
-    for (const ws of this.state.getWebSockets()) {
-      try { ws.close(1000, reason) } catch { /* gone */ }
+    for (const conn of this.getConnections()) {
+      try { conn.close(1000, reason) } catch { /* gone */ }
     }
     this.failAllClients(reason)
     for (const [, p] of this.pendingRest) {
@@ -378,6 +401,6 @@ export class HermesSessionDO implements DurableObject {
     }
     this.pendingRest.clear()
     this.init = null
-    this.state.storage.deleteAll()
+    void this.ctx.storage.deleteAll()
   }
 }

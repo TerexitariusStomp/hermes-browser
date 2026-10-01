@@ -14,5 +14,8 @@
     "typescript": "^5.7.0",
     "wrangler": "^4.131.0",
     "ws": "^8.22.0"
+  },
+  "dependencies": {
+    "partyserver": "^0.5.10"
   }
 }

@@ -811,16 +811,39 @@
     }).then(function (m0) {
       var meta = m0.meta
       var wsBase = relayBase.replace(/^http/, 'ws')
-      var ws = new RealWebSocket(wsBase + '/s/' + meta.sid + '/agent?token=' + encodeURIComponent(meta.agentToken))
-      share = { ws: ws, meta: meta, grant: m0.grant, relayBase: relayBase, state: 'connecting' }
-      ws.onmessage = onRelayMessage
-      ws.onopen = function () { if (share) { share.state = 'live'; updateShareUI() } }
-      ws.onclose = function () {
-        if (share && share.ws === ws) stopShare('relay-closed')
-      }
-      ws.onerror = function () { if (share) { share.state = 'error'; updateShareUI() } }
-      updateShareUI()
-      return meta
+      var url = wsBase + '/s/' + meta.sid + '/agent?token=' + encodeURIComponent(meta.agentToken)
+      return import('./vendor/partysocket-ws.js').then(function (mod) {
+        // partysocket's ReconnectingWebSocket owns retry/backoff/send-queue.
+        // Reconnect only on abnormal drops (1006): a clean 1000 is the relay
+        // ending or replacing this session — never redial that. Explicit
+        // stopShare()/close() also disables retry inside the library.
+        var ws = new mod.default(url, null, {
+          WebSocket: RealWebSocket,
+          maxRetries: 25,
+          shouldReconnectOnClose: function (ev) { return ev.code === 1006 },
+        })
+        share = { ws: ws, meta: meta, grant: m0.grant, relayBase: relayBase, state: 'connecting' }
+        ws.onmessage = onRelayMessage
+        ws.onopen = function () { if (share) { share.state = 'live'; updateShareUI() } }
+        ws.onclose = function (ev) {
+          if (!share || share.ws !== ws) return
+          if (ev && ev.code === 1006 && ws.retryCount < 25) {
+            // The DO fails all client sockets on agent disconnect; close the
+            // corresponding local sidecars so a redial starts clean.
+            for (var lid in remoteSocks) postToWorker({ t: 'ws-close', id: Number(lid), code: 1006, reason: 'relay-drop' })
+            remoteSocks = {}
+            remoteByCid = {}
+            remoteRest = {}
+            share.state = 'reconnecting'
+            updateShareUI()
+            return
+          }
+          stopShare('relay-closed')
+        }
+        ws.onerror = function () { if (share) { share.state = 'error'; updateShareUI() } }
+        updateShareUI()
+        return meta
+      })
     })
   }
 

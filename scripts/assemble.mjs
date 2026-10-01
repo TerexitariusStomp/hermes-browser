@@ -60,6 +60,10 @@ cpSync(resolve(root, 'node_modules/penpal/dist/penpal.mjs'),
 cpSync(resolve(root, 'node_modules/idb/build/index.js'),
   join(out, 'vendor', 'idb.mjs'))
 
+// partysocket (ISC) — reconnecting WebSocket for the relay agent dial.
+cpSync(resolve(root, 'node_modules/partysocket/dist/ws.js'),
+  join(out, 'vendor', 'partysocket-ws.js'))
+
 // Companion host agent (P6/T3 opt-in substrate) — downloadable from the site.
 try {
   cpSync(join(root, 'host-agent', 'host-agent.py'), join(out, 'host-agent.py'))
