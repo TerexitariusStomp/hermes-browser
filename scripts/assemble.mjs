@@ -56,6 +56,10 @@ cpSync(join(coincidentDist, 'worker.js'), join(out, 'vendor', 'coincident-worker
 cpSync(resolve(root, 'node_modules/penpal/dist/penpal.mjs'),
   join(out, 'vendor', 'penpal.mjs'))
 
+// idb (ISC) — IndexedDB promise wrapper used by pwa-bridge + vault worker.
+cpSync(resolve(root, 'node_modules/idb/build/index.js'),
+  join(out, 'vendor', 'idb.mjs'))
+
 // Companion host agent (P6/T3 opt-in substrate) — downloadable from the site.
 try {
   cpSync(join(root, 'host-agent', 'host-agent.py'), join(out, 'host-agent.py'))

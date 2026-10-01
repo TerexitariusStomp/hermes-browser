@@ -20,6 +20,7 @@
  *   listGrants {}              -> {grants:[...]}
  */
 import coincident from './vendor/coincident-worker.js'
+import { openDB } from './vendor/idb.mjs'
 
 const DB_NAME = 'hermes-vault'
 const SECRETS_STORE = 'secrets'
@@ -27,36 +28,23 @@ const KEY_STORE = 'devicekey'
 const GRANTS_STORE = 'grants'
 
 function openDb() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 2)
-    req.onupgradeneeded = (e) => {
-      const db = req.result
+  return openDB(DB_NAME, 2, {
+    upgrade(db) {
       if (!db.objectStoreNames.contains(SECRETS_STORE))
         db.createObjectStore(SECRETS_STORE, { keyPath: 'handle' })
       if (!db.objectStoreNames.contains(KEY_STORE))
         db.createObjectStore(KEY_STORE, { keyPath: 'id' })
       if (!db.objectStoreNames.contains(GRANTS_STORE))
         db.createObjectStore(GRANTS_STORE, { keyPath: 'id' })
-    }
-    req.onsuccess = () => resolve(req.result)
-    req.onerror = () => reject(req.error)
-  })
-}
-
-function tx(db, store, mode, fn) {
-  return new Promise((resolve, reject) => {
-    const t = db.transaction(store, mode)
-    const r = fn(t.objectStore(store))
-    t.oncomplete = () => resolve(r.result)
-    t.onerror = () => reject(t.error)
+    },
   })
 }
 
 async function deviceKey(db) {
-  const row = await tx(db, KEY_STORE, 'readonly', (s) => s.get('local'))
+  const row = await db.get(KEY_STORE, 'local')
   if (row && row.key) return row.key
   const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
-  await tx(db, KEY_STORE, 'readwrite', (s) => s.put({ id: 'local', key }))
+  await db.put(KEY_STORE, { id: 'local', key })
   return key
 }
 
@@ -68,13 +56,13 @@ async function storeSecret(db, value, label) {
   const iv = crypto.getRandomValues(new Uint8Array(12))
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(value))
   const handle = 'h_' + crypto.randomUUID().replace(/-/g, '')
-  await tx(db, SECRETS_STORE, 'readwrite', (s) =>
-    s.put({ handle, label: label || '', created: Date.now(), revoked: false, iv: b64(iv), ct: b64(ct) }))
+  await db.put(SECRETS_STORE,
+    { handle, label: label || '', created: Date.now(), revoked: false, iv: b64(iv), ct: b64(ct) })
   return handle
 }
 
 async function readSecret(db, handle) {
-  const row = await tx(db, SECRETS_STORE, 'readonly', (s) => s.get(handle))
+  const row = await db.get(SECRETS_STORE, handle)
   if (!row || row.revoked) return null
   const key = await deviceKey(db)
   const pt = await crypto.subtle.decrypt(
@@ -83,7 +71,7 @@ async function readSecret(db, handle) {
 }
 
 async function loadGrant(db, id) {
-  const row = await tx(db, GRANTS_STORE, 'readonly', (s) => s.get(id))
+  const row = await db.get(GRANTS_STORE, id)
   if (!row || row.revoked) return null
   return row
 }
@@ -117,12 +105,12 @@ const ops = {
   async storeSecret(db, m) { return { handle: await storeSecret(db, m.value, m.label) } },
   async resolveHeader(db, m) { return { value: await resolveHeader(db, m.value, m.grant) } },
   async revoke(db, m) {
-    const row = await tx(db, SECRETS_STORE, 'readonly', (s) => s.get(m.handle))
-    if (row) await tx(db, SECRETS_STORE, 'readwrite', (s) => s.put({ ...row, revoked: true }))
+    const row = await db.get(SECRETS_STORE, m.handle)
+    if (row) await db.put(SECRETS_STORE, { ...row, revoked: true })
     return { ok: !!row }
   },
   async list(db) {
-    const rows = await tx(db, SECRETS_STORE, 'readonly', (s) => s.getAll())
+    const rows = await db.getAll(SECRETS_STORE)
     return { handles: rows.map((r) => ({ handle: r.handle, label: r.label, created: r.created, revoked: r.revoked })) }
   },
   async createGrant(db, m) {
@@ -135,7 +123,7 @@ const ops = {
       created: Date.now(),
       revoked: false,
     }
-    await tx(db, GRANTS_STORE, 'readwrite', (s) => s.put(grant))
+    await db.put(GRANTS_STORE, grant)
     return { grant: grant.id }
   },
   async grantAddHandle(db, m) {
@@ -144,14 +132,14 @@ const ops = {
     if (grant.handles !== '*') {
       if (!grant.handles.includes(m.handle)) {
         grant.handles = grant.handles.concat([m.handle])
-        await tx(db, GRANTS_STORE, 'readwrite', (s) => s.put(grant))
+        await db.put(GRANTS_STORE, grant)
       }
     }
     return { ok: true }
   },
   async revokeGrant(db, m) {
-    const row = await tx(db, GRANTS_STORE, 'readonly', (s) => s.get(m.grant))
-    if (row) await tx(db, GRANTS_STORE, 'readwrite', (s) => s.put({ ...row, revoked: true }))
+    const row = await db.get(GRANTS_STORE, m.grant)
+    if (row) await db.put(GRANTS_STORE, { ...row, revoked: true })
     return { ok: !!row }
   },
   async listGrants(db) {

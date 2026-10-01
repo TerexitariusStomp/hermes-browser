@@ -5,51 +5,24 @@
 // rest. Grant state is auditable via `status` and persisted handles live in
 // IndexedDB so a granted folder survives reloads.
 
+import { openDB } from './vendor/idb.mjs'
+
 const DB_NAME = 'hermes-pwa'
 const STORE = 'handles'
 
 let dbPromise = null
 function db() {
   if (!dbPromise) {
-    dbPromise = new Promise(function (res, rej) {
-      const r = indexedDB.open(DB_NAME, 1)
-      r.onupgradeneeded = function () { r.result.createObjectStore(STORE) }
-      r.onsuccess = function () { res(r.result) }
-      r.onerror = function () { rej(r.error) }
+    dbPromise = openDB(DB_NAME, 1, {
+      upgrade(d) { d.createObjectStore(STORE) },
     })
   }
   return dbPromise
 }
 
-async function idbPut(key, val) {
-  const d = await db()
-  return new Promise(function (res, rej) {
-    const tx = d.transaction(STORE, 'readwrite')
-    tx.objectStore(STORE).put(val, key)
-    tx.oncomplete = res
-    tx.onerror = function () { rej(tx.error) }
-  })
-}
-
-async function idbGet(key) {
-  const d = await db()
-  return new Promise(function (res, rej) {
-    const tx = d.transaction(STORE, 'readonly')
-    const rq = tx.objectStore(STORE).get(key)
-    rq.onsuccess = function () { res(rq.result) }
-    rq.onerror = function () { rej(rq.error) }
-  })
-}
-
-async function idbDel(key) {
-  const d = await db()
-  return new Promise(function (res, rej) {
-    const tx = d.transaction(STORE, 'readwrite')
-    tx.objectStore(STORE).delete(key)
-    tx.oncomplete = res
-    tx.onerror = function () { rej(tx.error) }
-  })
-}
+const idbPut = async (k, v) => (await db()).put(STORE, v, k)
+const idbGet = async (k) => (await db()).get(STORE, k)
+const idbDel = async (k) => (await db()).delete(STORE, k)
 
 // --- pending interactive grants ------------------------------------------
 // FSA pickers require transient user activation: the op parks a resolver

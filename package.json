@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "coincident": "^4.1.1",
+    "idb": "^8.0.3",
     "penpal": "^7.0.6",
     "pyodide": "0.28.3"
   },
