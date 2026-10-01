@@ -89,8 +89,10 @@ createServer((req, res) => {
   if (!existsSync(p) || statSync(p).isDirectory()) p = join(ROOT, 'index.html')
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp')
-  // Embed parity with dist/_headers: the app is frameable by other origins.
+  // Embed parity with dist/_headers: the app is frameable by other origins,
+  // and cross-origin module imports (vendor/penpal.mjs) fetch in CORS mode.
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin')
+  res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Content-Type', MIME[extname(p)] || 'application/octet-stream')
   createReadStream(p).pipe(res)
 }).listen(PORT, () => console.log(`serving ${ROOT} on :${PORT}`))
