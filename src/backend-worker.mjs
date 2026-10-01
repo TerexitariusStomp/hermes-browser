@@ -1,85 +1,26 @@
 /**
  * backend-worker.mjs — the real Hermes backend under Pyodide.
  *
- * Inbound frames arrive on a SharedArrayBuffer ring written by the page
- * (postMessage can't reach this worker while Python is blocked in
- * Atomics.wait). Outbound frames go via postMessage — fire-and-forget is
- * fine in this direction.
- *
- * Ring layout (Int32 header over SAB):
- *   [0] seq doorbell — incremented by the writer, Atomics.wait target
- *   [1] write offset (bytes into data region, monotonic mod CAP)
- *   [2] read offset
- *   data region: CAP bytes of u32-length-prefixed UTF-8 frames, wrap-around
- *
- * Single producer (page) / single consumer (this worker).
+ * Transport is coincident (MIT): synchronous worker→page proxy calls over
+ * SharedArrayBuffer + Atomics. Python's pump parks inside
+ * proxy.pullInbound(ms), which resolves when the page has buffered inbound
+ * frames; outbound events are plain postMessage (fire-and-forget).
+ * postMessage alone could never reach this worker while Python blocks —
+ * coincident's sync channel carries both directions.
  */
 import { loadPyodide } from './pyodide/pyodide.mjs'
+import coincident from './vendor/coincident-worker.js'
 
-const RING_CAP = 4 * 1024 * 1024
-
-let hdr        // Int32Array view over sab (header)
-let data       // Uint8Array view over sab (data region)
-let lastSeq = 0
-
-function initRing(sab) {
-  hdr = new Int32Array(sab, 0, 4)
-  data = new Uint8Array(sab, 16)
-}
-
-const FRAG_MORE = 0x80000000
-let fragBuf = null   // accumulated fragments of one logical frame
-
-function ringDrain() {
-  // Returns all complete frames currently in the ring. Records whose
-  // length word carries FRAG_MORE are fragments — the single-producer
-  // page writes them contiguously; a frame completes on the first
-  // record without the flag.
-  const out = []
-  const w = Atomics.load(hdr, 1)
-  let r = Atomics.load(hdr, 2)
-  while (r !== w) {
-    // The 4-byte length word wraps the ring end like any payload bytes.
-    const h = data[(r) % RING_CAP] | (data[(r + 1) % RING_CAP] << 8) |
-      (data[(r + 2) % RING_CAP] << 16) | (data[(r + 3) % RING_CAP] << 24)
-    const raw = h >>> 0
-    const more = (raw & FRAG_MORE) !== 0
-    const len = raw & ~FRAG_MORE
-    r = (r + 4) % RING_CAP
-    const bytes = new Uint8Array(len)
-    for (let i = 0; i < len; i++) bytes[i] = data[(r + i) % RING_CAP]
-    r = (r + len) % RING_CAP
-    if (more) {
-      if (fragBuf) fragBuf.push(bytes); else fragBuf = [bytes]
-      continue
-    }
-    let frame = bytes
-    if (fragBuf) {
-      fragBuf.push(bytes)
-      const total = fragBuf.reduce((n, c) => n + c.length, 0)
-      frame = new Uint8Array(total)
-      let off = 0
-      for (const c of fragBuf) { frame.set(c, off); off += c.length }
-      fragBuf = null
-    }
-    out.push(new TextDecoder().decode(frame))
-  }
-  Atomics.store(hdr, 2, r)
-  return out
-}
+const { proxy } = await coincident()
 
 const bridge = {
-  // Called from inside Python while it blocks on a primitive. Atomics.wait
-  // sleeps until the page bumps the doorbell; then we drain the ring and
-  // return raw frame strings for Python to route.
+  // Called from inside Python while it blocks on a primitive. The page
+  // resolves pullInbound with the buffered inbound frames; an empty array
+  // on timeout means "poll again" — same bounded-wait semantics as before.
   pump(ms) {
-    // Doorbell-driven, but bounded: any wakeup path Python missed (asyncio
-    // internals queuing work outside the ring) costs a poll cycle, never a
-    // permanent stall. 500ms is invisible to users and idle-cheap.
-    const seq = Atomics.load(hdr, 0)
-    Atomics.wait(hdr, 0, seq, ms < 0 ? 500 : Math.min(ms, 500))
-    lastSeq = Atomics.load(hdr, 0)
-    return ringDrain()
+    // -1 = nothing scheduled: park until a frame arrives. Finite waits are
+    // clamped to 500ms like the old bounded Atomics.wait.
+    return proxy.pullInbound(ms < 0 ? -1 : Math.min(ms, 500))
   },
   emit(wsId, text) {
     self.postMessage({ type: 'ws-event', id: wsId, event: 'message', data: text })
@@ -99,30 +40,30 @@ const bridge = {
       bodyB64,
     })
   },
-  fetchRequest(id, url, method, headersJson, bodyB64, grant) {
-    self.postMessage({
-      type: 'net-request', id, url, method,
-      headers: JSON.parse(headersJson), bodyB64, grant: grant || null,
-    })
+  // Page-mediated request/response channels — all synchronous proxy calls.
+  // headersJson/argsJson cross as strings; the page resolves the return
+  // value and coincident hands it back here as the call result.
+  fetchRequest(url, method, headersJson, bodyB64, grant) {
+    return proxy.fetchRequest(
+      url, method, headersJson, bodyB64, grant || null)
   },
-  substrateRequest(id, op, argsJson) {
+  substrateRequest(op, argsJson) {
     // Extension substrate call — page relays a fixed-op request to the
     // Hermes substrate extension's content-script bridge (grant-gated there).
-    self.postMessage({ type: 'substrate-request', id, op, args: JSON.parse(argsJson || '{}') })
+    return proxy.substrateRequest(op, argsJson)
   },
-  wasiRequest(id, op, argsJson) {
-    // In-page WASI runner (cowasm userspace) — no extension involvement.
-    self.postMessage({ type: 'wasi-request', id, op, args: JSON.parse(argsJson || '{}') })
+  wasiRequest(op, argsJson) {
+    // In-page WASI runner — no extension involvement.
+    return proxy.wasiRequest(op, argsJson)
   },
-  pwaRequest(id, op, argsJson) {
-    // In-page browser-grant ops (Notification/FSA/mic/wakeLock/periodicSync)
-    // — pwa-bridge.js executes them against the page's own APIs.
-    self.postMessage({ type: 'pwa-request', id, op, args: JSON.parse(argsJson || '{}') })
+  pwaRequest(op, argsJson) {
+    // In-page browser-grant ops — pwa-bridge.js executes them against the
+    // page's own APIs.
+    return proxy.pwaRequest(op, argsJson)
   },
-  hostRequest(id, op, argsJson) {
-    // Opt-in local host substrate (companion host-agent.py on 127.0.0.1) —
-    // host-bridge.js fetches with the vault-resolved pairing token.
-    self.postMessage({ type: 'host-request', id, op, args: JSON.parse(argsJson || '{}') })
+  hostRequest(op, argsJson) {
+    // Opt-in local host substrate (companion host-agent.py on 127.0.0.1).
+    return proxy.hostRequest(op, argsJson)
   },
   log(level, msg) { console.log('[py]', msg) },
 }
@@ -130,7 +71,6 @@ const bridge = {
 self.onmessage = async (ev) => {
   const msg = ev.data
   if (msg.type !== 'boot') return
-  initRing(msg.sab)
   try {
     await main(msg)
   } catch (e) {
@@ -199,11 +139,10 @@ py_gateway.boot(${JSON.stringify(String(msg.sessionToken || ''))}, ${JSON.string
   const runtime = pyodide.pyimport('browser_runtime')
   self.postMessage({ type: 'boot-ready' })
 
-  // Main loop: block on the ring until frames arrive, route each into Python,
-  // then drain Python-side work (loop tasks, thread reschedules) to quiescence.
-  // Python calls that block (approvals, vault fetches) re-enter bridge.pump
-  // internally, so this loop only advances when the interpreter is idle.
-  // bridge.pump is bounded at 500ms, so due timers fire even with no traffic.
+  // Main loop: park in pullInbound until the page hands over frames, route
+  // each into Python, then drain Python-side work (loop tasks, thread
+  // reschedules) to quiescence. Python calls that block (approvals, vault
+  // fetches) are synchronous proxy calls that park the same way.
   while (true) {
     const frames = bridge.pump(-1)
     for (const raw of frames) {

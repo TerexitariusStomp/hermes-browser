@@ -16,6 +16,7 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
+    "coincident": "^4.1.1",
     "pyodide": "0.28.3"
   },
   "devDependencies": {

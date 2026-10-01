@@ -6,9 +6,10 @@
  * call is served by the in-page Pyodide backend worker. The vendored
  * renderer is byte-identical to upstream.
  *
- * Transport: page -> worker over a SharedArrayBuffer ring + Atomics
- * doorbell (the worker can be blocked in Atomics.wait inside Python, so
- * postMessage alone cannot reach it). Worker -> page uses postMessage.
+ * Transport: coincident (MIT) — synchronous worker->page proxy calls over
+ * SharedArrayBuffer + Atomics. Python parks inside proxy.pullInbound(ms)
+ * until the page hands over buffered inbound frames; worker->page events
+ * remain plain postMessage (fire-and-forget is fine in that direction).
  */
 (function () {
   'use strict'
@@ -36,74 +37,20 @@
     sessionToken = 'x'.repeat(43)
   }
 
-  // --- 2. Ring buffer to the backend worker ------------------------------
-  var RING_CAP = 4 * 1024 * 1024
-  var sab = new SharedArrayBuffer(16 + RING_CAP)
-  var hdr = new Int32Array(sab, 0, 4)   // [0]=seq doorbell [1]=write [2]=read
-  var data = new Uint8Array(sab, 16)
-  var enc = new TextEncoder()
-  var FRAG_MORE = 0x80000000            // len-field flag: more fragments follow
-  var FRAG_MAX = 1024 * 1024            // fragment payload — always fits an empty ring
-  var PENDING_MAX = 64 * 1024 * 1024    // queued-bytes cap before real drops
-
-  function ringWriteRecord(record) {   // record: framed [len|flags][payload]
-    var need = record.byteLength
-    var w = Atomics.load(hdr, 1)
-    var r = Atomics.load(hdr, 2)
-    var free = (w >= r ? RING_CAP - (w - r) : r - w) - 1
-    if (need > free) return false
-    for (var i = 0; i < need; i++) data[(w + i) % RING_CAP] = record[i]
-    w = (w + need) % RING_CAP
-    Atomics.store(hdr, 1, w)
-    Atomics.add(hdr, 0, 1)
-    Atomics.notify(hdr, 0)
-    return true
-  }
-
-  var pendingWrites = []               // FIFO of framed records awaiting space
-  var pendingBytes = 0
-  var flushTimer = null
-  function flushPending() {
-    flushTimer = null
-    while (pendingWrites.length && ringWriteRecord(pendingWrites[0])) {
-      pendingBytes -= pendingWrites.shift().byteLength
-    }
-    if (pendingWrites.length) flushTimer = setTimeout(flushPending, 4)
-  }
-  function enqueueRecord(record) {
-    pendingWrites.push(record)
-    pendingBytes += record.byteLength
-    if (pendingBytes > PENDING_MAX) {
-      var dropped = pendingWrites.shift()
-      pendingBytes -= dropped.byteLength
-      console.error('[hermes-web] ring backpressure overflow; dropped record')
-    }
-    flushPending()
-  }
+  // --- 2. Inbound frame buffer to the backend worker ---------------------
+  // The worker pulls: its pump is a sync proxy.pullInbound(ms) call that
+  // parks until frames exist or the timeout elapses, then resolves with
+  // the drained array (JSON strings — py_gateway.handle parses each).
+  var inbound = []
+  var pullWaiter = null
 
   function postToWorker(msg) {
-    var bytes = enc.encode(JSON.stringify(msg))
-    // Fragment oversized frames; single-producer ordering keeps fragments
-    // contiguous — the worker concatenates until a record without FRAG_MORE.
-    var dv = new DataView(new ArrayBuffer(4))
-    if (bytes.length <= FRAG_MAX) {
-      dv.setUint32(0, bytes.length, true)
-      enqueueRecord(concatBytes(dv.buffer, bytes))
-      return
+    inbound.push(msg)
+    if (pullWaiter) {
+      var r = pullWaiter
+      pullWaiter = null
+      r()
     }
-    for (var off = 0; off < bytes.length; off += FRAG_MAX) {
-      var chunk = bytes.subarray(off, Math.min(off + FRAG_MAX, bytes.length))
-      var last = off + FRAG_MAX >= bytes.length
-      var h = new DataView(new ArrayBuffer(4))
-      h.setUint32(0, last ? chunk.length : (chunk.length | FRAG_MORE), true)
-      enqueueRecord(concatBytes(h.buffer, chunk))
-    }
-  }
-  function concatBytes(a, b) {
-    var out = new Uint8Array(a.byteLength + b.byteLength)
-    out.set(new Uint8Array(a), 0)
-    out.set(b, a.byteLength)
-    return out
   }
 
   // --- 3. Vault boundary ------------------------------------------------
@@ -113,47 +60,22 @@
   // Outbound fetches resolving `vault:` placeholders go through the same
   // worker — key material never enters the Pyodide heap or page JS.
 
-  var vaultWorker = new Worker('./vault-worker.mjs', { type: 'module' })
-  var vaultNext = 1
-  var vaultPending = {}
-  var vaultDead = null
-  vaultWorker.onmessage = function (ev) {
-    var m = ev.data
-    if (vaultPending[m.id]) {
-      vaultPending[m.id](m)
-      delete vaultPending[m.id]
-    }
-  }
-  vaultWorker.onmessageerror = function (e) { console.error('[vault] messageerror ' + e) }
-  function vaultFailAll(err) {
-    vaultDead = err
-    console.error('[vault] worker failed: ' + err)
-    Object.keys(vaultPending).forEach(function (id) {
-      vaultPending[id]({ id: Number(id), error: String(err) })
-      delete vaultPending[id]
-    })
-  }
-  vaultWorker.onerror = function (e) { vaultFailAll(e && e.message || 'worker error') }
+  var vaultWorkerPromise = null
 
   function vaultCall(op, payload) {
-    return new Promise(function (resolve) {
-      if (vaultDead) return resolve({ error: vaultDead })
-      var id = vaultNext++
-      vaultPending[id] = resolve
-      setTimeout(function () {
-        if (vaultPending[id]) {
-          delete vaultPending[id]
-          console.error('[vault] ' + op + ' timed out')
-          resolve({ error: 'vault timeout' })
-        }
-      }, 15000)
-      try {
-        vaultWorker.postMessage(Object.assign({ id: id, op: op }, payload))
-      } catch (e) {
-        delete vaultPending[id]
-        console.error('[vault] postMessage threw: ' + e)
-        resolve({ error: String(e) })
-      }
+    // Lazily construct the coincident worker — the same dynamic import that
+    // loads the backend's transport class.
+    if (!vaultWorkerPromise) {
+      vaultWorkerPromise = import('./vendor/coincident-main.js').then(function (mod) {
+        return new (mod.default().Worker)('./vault-worker.mjs', { type: 'module' })
+      })
+      vaultWorkerPromise.catch(function (e) {
+        console.error('[vault] worker init failed: ' + e)
+        vaultWorkerPromise = null
+      })
+    }
+    return vaultWorkerPromise.then(function (w) {
+      return withTimeout(w.proxy.call(op, payload || {}), 15000, 'vault ' + op)
     })
   }
 
@@ -183,8 +105,12 @@
   }
 
   // --- 4. Backend worker --------------------------------------------------
-  var worker = new Worker('./backend-worker.mjs', { type: 'module' })
-  var rpcLog = (window.__HERMES_API_LOG__ = [])
+  // coincident wraps Worker: worker code calls proxy.<fn> synchronously;
+  // we register the handlers here. `native` false means no cross-origin
+  // isolation — the backend cannot park, so boot fails loudly instead of
+  // hanging.
+  var CoWorker = null       // coincident's Worker class (module import below)
+  var worker = null
   var bootReady = false
   var bootWaiters = []
 
@@ -239,7 +165,7 @@
     }
   }
 
-  worker.onmessage = function (ev) {
+  function onWorkerMessage(ev) {
     var msg = ev.data
     if (msg.type === 'fetch-response' && remoteRest[msg.id] !== undefined) {
       var rid = remoteRest[msg.id]
@@ -273,20 +199,6 @@
       p.resolve(new Response(bodyBytes, { status: msg.status, headers: msg.headers }))
     } else if (msg.type === 'ws-event' && sockets[msg.id]) {
       sockets[msg.id]._onWorkerEvent(msg)
-    } else if (msg.type === 'net-request') {
-      handleNetRequest(msg)
-    } else if (msg.type === 'substrate-request') {
-      substrateCall(msg.op, msg.args || {}).then(function (result) {
-        postToWorker({ t: 'substrate-resp', id: msg.id, result: result })
-      })
-    } else if (msg.type === 'wasi-request') {
-      wasiCall(msg.op, msg.args || {}).then(function (result) {
-        postToWorker({ t: 'wasi-resp', id: msg.id, result: result })
-      })
-    } else if (msg.type === 'pwa-request') {
-      handlePwaRequest(msg)
-    } else if (msg.type === 'host-request') {
-      handleHostRequest(msg)
     } else if (msg.type === 'log') {
       (msg.stream === 'err' ? console.warn : console.log)('[backend]', msg.text)
     } else if (msg.type === 'boot-ready') {
@@ -298,6 +210,65 @@
     }
   }
 
+  // coincident proxy handlers — the worker's synchronous calls land here
+  // and the returned promise's resolution is handed back on the parked
+  // thread. Each mirrors an old net-request/substrate-request/... message.
+  function registerProxyHandlers(w) {
+    w.proxy.pullInbound = function (ms) {
+      return new Promise(function (resolve) {
+        var drain = function () {
+          pullWaiter = null
+          resolve(inbound.splice(0).map(JSON.stringify))
+        }
+        if (inbound.length) return drain()
+        pullWaiter = drain
+        if (ms > 0 && ms < 2147483647) {
+          setTimeout(function () {
+            if (pullWaiter === drain) drain()
+          }, ms)
+        }
+      })
+    }
+    w.proxy.fetchRequest = function (url, method, headersJson, bodyB64, grant) {
+      return fetchRequestDirect(url, method, headersJson, bodyB64, grant)
+    }
+    w.proxy.substrateRequest = function (op, argsJson) {
+      return withTimeout(substrateCall(op, JSON.parse(argsJson || '{}')),
+        100000, 'substrate')
+    }
+    w.proxy.wasiRequest = function (op, argsJson) {
+      return withTimeout(wasiCall(op, JSON.parse(argsJson || '{}')), 60000, 'wasi')
+    }
+    w.proxy.pwaRequest = function (op, argsJson) {
+      return withTimeout(pwaHandle(op, JSON.parse(argsJson || '{}')), 60000, 'pwa')
+    }
+    w.proxy.hostRequest = function (op, argsJson) {
+      return withTimeout(hostHandle(op, JSON.parse(argsJson || '{}')), 60000, 'host')
+    }
+  }
+
+  import('./vendor/coincident-main.js').then(function (mod) {
+    var co = mod.default()
+    CoWorker = co.Worker
+    var w = new CoWorker('./backend-worker.mjs', { type: 'module' })
+    registerProxyHandlers(w)
+    w.onmessage = onWorkerMessage
+    worker = w
+    worker.postMessage({
+      type: 'boot',
+      interruptSab: interruptSab,
+      pyodideUrl: './pyodide/',
+      pyZipUrl: './hermes-py.zip',
+      envZipUrl: './hermes-env.zip',
+      overlayManifestUrl: './overlay/manifest.json',
+      persistHome: true,
+      sessionToken: sessionToken,
+      publicHost: window.location.hostname,
+    })
+  }).catch(function (e) {
+    console.error('[hermes-web] transport init failed:', e)
+  })
+
   // The backend's Python httpx transport asks the page to perform fetches so
   // vault resolution happens outside the agent's heap.
   // --- local model endpoint ----------------------------------------------
@@ -308,34 +279,45 @@
   var LOCAL_LLM_HOST = 'local-llm.hermes'
   var localLlmMod = null
 
-  function handleLocalLlm(msg) {
-    var u
-    try {
-      u = new URL(msg.url)
-    } catch (e) {
-      postToWorker({ t: 'net-resp', id: msg.id, status: 400, headers: {}, body: '' })
-      return
-    }
+  // Worker-side timeout loops are gone (sync proxy calls return results
+  // directly), so page handlers impose the deadlines themselves.
+  function withTimeout(p, ms, label) {
+    return new Promise(function (resolve) {
+      var timer = setTimeout(function () {
+        resolve({ error: label + ' timeout' })
+      }, ms)
+      Promise.resolve(p).then(function (r) {
+        clearTimeout(timer)
+        resolve(r)
+      }, function (e) {
+        clearTimeout(timer)
+        resolve({ error: String(e).slice(0, 300) })
+      })
+    })
+  }
+
+  function localLlmFetch(url, method, bodyB64) {
+    var u = new URL(url)
     var bodyText = ''
-    if (msg.bodyB64) {
+    if (bodyB64) {
       try {
-        var raw = Uint8Array.from(atob(msg.bodyB64), function (c) { return c.charCodeAt(0) })
+        var raw = Uint8Array.from(atob(bodyB64), function (c) { return c.charCodeAt(0) })
         bodyText = new TextDecoder().decode(raw)
       } catch (e) {}
     }
     var modP = localLlmMod
       ? Promise.resolve(localLlmMod)
       : import('./local-llm.js').then(function (m) { localLlmMod = m; return m })
-    console.log('[local-llm] ' + msg.method + ' ' + u.pathname)
-    modP.then(function (m) {
-      return m.handleRequest(u.pathname, msg.method, bodyText)
+    console.log('[local-llm] ' + method + ' ' + u.pathname)
+    return modP.then(function (m) {
+      return m.handleRequest(u.pathname, method, bodyText)
     }).then(function (r) {
       var b = unescape(encodeURIComponent(r.body || ''))
-      postToWorker({ t: 'net-resp', id: msg.id, status: r.status, headers: r.headers || {}, body: btoa(b) })
+      return { status: r.status, headers: r.headers || {}, body: btoa(b) }
     }).catch(function (e) {
       console.log('[local-llm] ERR ' + String(e).slice(0, 200))
-      postToWorker({ t: 'net-resp', id: msg.id, status: 500, headers: { 'content-type': 'application/json' },
-        body: btoa(JSON.stringify({ error: { message: String(e).slice(0, 300) } })) })
+      return { status: 500, headers: { 'content-type': 'application/json' },
+        body: btoa(JSON.stringify({ error: { message: String(e).slice(0, 300) } })) }
     })
   }
 
@@ -345,16 +327,14 @@
   // fixed op vocabulary, no code crosses the boundary.
   var pwaMod = null
 
-  function handlePwaRequest(msg) {
+  function pwaHandle(op, args) {
     var modP = pwaMod
       ? Promise.resolve(pwaMod)
       : import('./pwa-bridge.js').then(function (m) { pwaMod = m; return m })
-    modP.then(function (m) {
-      return m.handle(msg.op, msg.args || {})
-    }).then(function (result) {
-      postToWorker({ t: 'pwa-resp', id: msg.id, result: result })
+    return modP.then(function (m) {
+      return m.handle(op, args || {})
     }).catch(function (e) {
-      postToWorker({ t: 'pwa-resp', id: msg.id, result: { error: String(e).slice(0, 300) } })
+      return { error: String(e).slice(0, 300) }
     })
   }
 
@@ -363,72 +343,77 @@
   // machine; the pairing token resolves via vault like provider secrets.
   var hostMod = null
 
-  function handleHostRequest(msg) {
+  function hostHandle(op, args) {
     var modP = hostMod
       ? Promise.resolve(hostMod)
       : import('./host-bridge.js').then(function (m) { hostMod = m; return m })
-    modP.then(function (m) {
-      return m.handle(msg.op, msg.args || {}, {
+    return modP.then(function (m) {
+      return m.handle(op, args || {}, {
         vaultCall: vaultCall,
         resolveHeaders: function (h) { return vaultResolveHeaders(h, '') },
       })
-    }).then(function (result) {
-      postToWorker({ t: 'host-resp', id: msg.id, result: result })
     }).catch(function (e) {
-      postToWorker({ t: 'host-resp', id: msg.id, result: { error: String(e).slice(0, 300) } })
+      return { error: String(e).slice(0, 300) }
     })
   }
 
-  function handleNetRequest(msg) {
+  function fetchRequestDirect(url, method, headersJson, bodyB64, grant) {
+    var headersIn = {}
+    try { headersIn = JSON.parse(headersJson || '{}') } catch (e) {}
     try {
-      if (new URL(msg.url).hostname === LOCAL_LLM_HOST) {
-        handleLocalLlm(msg)
-        return
+      if (new URL(url).hostname === LOCAL_LLM_HOST) {
+        return localLlmFetch(url, method, bodyB64)
       }
     } catch (e) {}
-    vaultResolveHeaders(msg.headers || {}, msg.grant).then(function (headers) {
-      // Bare-browser fetch is subject to each provider's CORS header
-      // allowlist; headers outside it fail preflight. x-stainless-* are
-      // OpenAI-SDK build diagnostics with no request semantics; upstream's
-      // X-OpenRouter-Cache(-TTL) response-cache hints are absent from
-      // openrouter.ai's Access-Control-Allow-Headers (they degrade to
-      // uncached responses, the request still succeeds). Non-CORS-capable
-      // providers belong on the extension/native substrate instead.
-      var HOST_HEADER_DENY = {
-        'openrouter.ai': ['x-openrouter-cache', 'x-openrouter-cache-ttl'],
-      }
-      var hostDeny = null
-      try {
-        hostDeny = HOST_HEADER_DENY[new URL(msg.url).hostname] || null
-      } catch (e) {}
-      Object.keys(headers).forEach(function (k) {
-        var kl = k.toLowerCase()
-        if (kl.indexOf('x-stainless-') === 0) delete headers[k]
-        else if (hostDeny && hostDeny.indexOf(kl) !== -1) delete headers[k]
-      })
-      var init = { method: msg.method, headers: headers }
-      if (msg.bodyB64) init.body = Uint8Array.from(atob(msg.bodyB64), function (c) { return c.charCodeAt(0) })
-      var urlTag = msg.url.split('?')[0]
-      console.log('[net] -> ' + msg.method + ' ' + urlTag)
-      return realFetch(msg.url, init).then(function (resp) {
-        console.log('[net] ' + msg.method + ' ' + urlTag + ' -> ' + resp.status)
-        return resp.arrayBuffer().then(function (ab) {
-          var bytes = new Uint8Array(ab)
-          // Chunked base64: byte-at-a-time concat is O(n²) and a ~30MB catalog
-          // response wedges the page main thread for minutes.
-          var bin = ''
-          var CH = 0x8000
-          for (var i = 0; i < bytes.length; i += CH)
-            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH))
-          var hs = {}
-          resp.headers.forEach(function (v, k) { hs[k] = v })
-          postToWorker({ t: 'net-resp', id: msg.id, status: resp.status, headers: hs, body: btoa(bin) })
+    var urlTag = url.split('?')[0]
+    return withTimeout(
+      vaultResolveHeaders(headersIn, grant).then(function (headers) {
+        // Bare-browser fetch is subject to each provider's CORS header
+        // allowlist; headers outside it fail preflight. x-stainless-* are
+        // OpenAI-SDK build diagnostics with no request semantics; upstream's
+        // X-OpenRouter-Cache(-TTL) response-cache hints are absent from
+        // openrouter.ai's Access-Control-Allow-Headers (they degrade to
+        // uncached responses, the request still succeeds). Non-CORS-capable
+        // providers belong on the extension/native substrate instead.
+        var HOST_HEADER_DENY = {
+          'openrouter.ai': ['x-openrouter-cache', 'x-openrouter-cache-ttl'],
+        }
+        var hostDeny = null
+        try {
+          hostDeny = HOST_HEADER_DENY[new URL(url).hostname] || null
+        } catch (e) {}
+        Object.keys(headers).forEach(function (k) {
+          var kl = k.toLowerCase()
+          if (kl.indexOf('x-stainless-') === 0) delete headers[k]
+          else if (hostDeny && hostDeny.indexOf(kl) !== -1) delete headers[k]
         })
+        var init = { method: method, headers: headers }
+        if (bodyB64) init.body = Uint8Array.from(atob(bodyB64), function (c) { return c.charCodeAt(0) })
+        console.log('[net] -> ' + method + ' ' + urlTag)
+        return realFetch(url, init).then(function (resp) {
+          console.log('[net] ' + method + ' ' + urlTag + ' -> ' + resp.status)
+          return resp.arrayBuffer().then(function (ab) {
+            var bytes = new Uint8Array(ab)
+            // Chunked base64: byte-at-a-time concat is O(n²) and a ~30MB
+            // catalog response wedges the page main thread for minutes.
+            var bin = ''
+            var CH = 0x8000
+            for (var i = 0; i < bytes.length; i += CH)
+              bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CH))
+            var hs = {}
+            resp.headers.forEach(function (v, k) { hs[k] = v })
+            return { status: resp.status, headers: hs, body: btoa(bin) }
+          })
+        })
+      }).catch(function (e) {
+        console.log('[net] ' + method + ' ' + urlTag + ' -> ERR ' + String(e).slice(0, 120))
+        return { status: 599, headers: {}, body: '', error: String(e) }
+      }), 120000, 'fetch').then(function (r) {
+        if (r && r.error === 'fetch timeout') {
+          return { status: 599, headers: {}, body: '', error: 'fetch timeout' }
+        }
+        return r
       })
-    }).catch(function (e) {
-      console.log('[net] ' + msg.method + ' ' + msg.url.split('?')[0] + ' -> ERR ' + String(e).slice(0, 120))
-      postToWorker({ t: 'net-resp', id: msg.id, status: 599, headers: {}, body: '', error: String(e) })
-    })
   }
 
   // --- 5. fetch shim ------------------------------------------------------
@@ -445,7 +430,6 @@
       return realFetch.apply(this, arguments)
     }
     var method = (init && init.method) || (input && input.method) || 'GET'
-    rpcLog.push({ kind: 'rest', method: method, path: url.pathname + url.search, ts: Date.now() })
     return new Promise(function (resolve, reject) {
       var id = nextId++
       pendingFetch[id] = { resolve: resolve, reject: reject }
@@ -506,7 +490,6 @@
     this._listeners = {}
     this._queue = []
     sockets[this._id] = this
-    rpcLog.push({ kind: 'ws-open', path: u.pathname + u.search, ts: Date.now() })
     var wsHeaders = { host: u.host, origin: window.location.origin }
     if (protocols) {
       wsHeaders['sec-websocket-protocol'] =
@@ -531,13 +514,11 @@
       if (handled) {
         handled.then(function (rewritten) {
           if (rewritten) {
-            rpcLog.push({ kind: 'ws-send', id: self._id, data: rewritten.slice(0, 4000), ts: Date.now() })
             postToWorker({ t: 'ws-send', id: self._id, data: rewritten })
           }
         }).catch(function (e) { console.error('[vault] write chain failed: ' + e) })
         return
       }
-      rpcLog.push({ kind: 'ws-send', id: this._id, data: String(d).slice(0, 4000), ts: Date.now() })
       postToWorker({ t: 'ws-send', id: this._id, data: d })
     },
     close: function (code, reason) {
@@ -564,7 +545,6 @@
         for (var i = 0; i < this._queue.length; i++) this.send(this._queue[i])
         this._queue = []
       } else if (msg.event === 'message') {
-        rpcLog.push({ kind: 'ws-recv', id: this._id, data: String(msg.data).slice(0, 4000), ts: Date.now() })
         maybeBindSession(this._id, msg.data)
         this._fire('message', { data: msg.data })
       } else if (msg.event === 'close') {
@@ -1035,23 +1015,13 @@
     injectShareUI()
   }
 
-  // --- 8. Boot ------------------------------------------------------------
+  // --- 8. Interrupt channel ------------------------------------------------
+  // Debug aid: page writes 2 to interruptSab[0] to SIGINT a wedged boot or
+  // a runaway prompt turn. The SAB rides the boot message; no COI needed
+  // for it beyond what coincident already requires.
   var interruptSab = new SharedArrayBuffer(8)
   window.__HERMES_INTERRUPT__ = new Int32Array(interruptSab)
-  worker.postMessage({
-    type: 'boot',
-    sab: sab,
-    interruptSab: interruptSab,
-    pyodideUrl: './pyodide/',
-    pyZipUrl: './hermes-py.zip',
-    envZipUrl: './hermes-env.zip',
-    overlayManifestUrl: './overlay/manifest.json',
-    persistHome: true,
-    sessionToken: sessionToken,
-    publicHost: window.location.hostname,
-
-  })
 
   window.__HERMES_BOOTSTRAP__ = { sessionToken: sessionToken, intercepted: true }
-  console.log('[hermes-web] bootstrap installed; api log at window.__HERMES_API_LOG__')
+  console.log('[hermes-web] bootstrap installed')
 })()

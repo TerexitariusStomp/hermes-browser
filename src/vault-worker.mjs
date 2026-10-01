@@ -6,7 +6,8 @@
  * `vault:<handle>` placeholders; resolution happens here, inside
  * resolveHeader, at fetch time.
  *
- * Ops:
+ * Transport is coincident: the page calls `vaultWorker.proxy.call(op,
+ * payload)` and the promise resolves with the op result. Ops:
  *   storeSecret {value, label} -> {handle}
  *   resolveHeader {value, grant?} -> {value}   (vault: placeholders replaced;
  *      when `grant` names a live grant, every handle must be in its scope —
@@ -18,6 +19,7 @@
  *   revokeGrant {grant}        -> {ok}        (tombstone: instant lockout)
  *   listGrants {}              -> {grants:[...]}
  */
+import coincident from './vendor/coincident-worker.js'
 
 const DB_NAME = 'hermes-vault'
 const SECRETS_STORE = 'secrets'
@@ -164,14 +166,13 @@ const ops = {
 }
 
 let dbPromise = null
-self.onmessage = async (ev) => {
-  const m = ev.data
+const { proxy } = await coincident()
+proxy.call = async (op, payload) => {
   try {
     dbPromise = dbPromise || openDb()
     const db = await dbPromise
-    const result = await ops[m.op](db, m)
-    self.postMessage({ id: m.id, ...result })
+    return await ops[op](db, payload || {})
   } catch (e) {
-    self.postMessage({ id: m.id, error: String(e && e.message || e) })
+    return { error: String(e && e.message || e) }
   }
 }

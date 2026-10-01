@@ -12,13 +12,17 @@ Runs inside the Pyodide worker. Owns:
   resolves vault: grant handles and performs the fetch — key material
   never enters this interpreter)
 
-JS contract (js.hermesBridge):
+JS contract (js.hermesBridge over coincident's sync proxy):
   emit(wsId, text)            — outbound text frame to a socket
   wsAccepted(wsId)            — socket is open on the wire
   wsClosed(wsId, code, reason)
-  pump(ms) -> [str]           — Atomics.wait + drain inbound ring
-  fetchRequest(...)           — enqueue a network request to the page
-  restReply(id, status, headersDict, bodyB64)
+  pump(ms) -> [str]           — park until the page hands over inbound frames
+  fetchRequest(...) -> dict   — sync network request to the page
+  substrateRequest(op, argsJson) -> dict  — fixed-op extension substrate
+  wasiRequest(op, argsJson) -> dict       — in-page WASI userspace
+  pwaRequest(op, argsJson) -> dict        — browser-grant ops
+  hostRequest(op, argsJson) -> dict       — local host-agent substrate
+  restReply(id, status, headersJson, bodyB64)
   log(level, msg)
 """
 
@@ -40,20 +44,10 @@ def _js():
 
 
 _sockets: dict[int, "_FakeWS"] = {}
-_pending_net: dict[int, dict] = {}
-_pending_sub: dict[int, dict] = {}
-_pending_wasi: dict[int, dict] = {}
-_pending_pwa: dict[int, dict] = {}
-_pending_host: dict[int, dict] = {}
 # Broker-grant bindings minted page-side at session.create; fetches on a
 # `prompt-turn-<sid>` thread carry that session's grant so the vault worker
 # enforces its scope (remote sub-grants resolve a strict subset of handles).
 _session_grants: dict[str, str] = {}
-_net_id = 0
-_sub_id = 0
-_wasi_id = 0
-_pwa_id = 0
-_host_id = 0
 _app = None
 _lifespan_cm = None
 _session_token = ""
@@ -196,16 +190,6 @@ def _route_pump_frame(frame: dict) -> None:
         ws_open(frame["id"], frame.get("path", ""), frame.get("headers"))
     elif t == "ws-close":
         ws_close(frame["id"])
-    elif t == "net-resp":
-        _pending_net[frame["id"]] = frame
-    elif t == "substrate-resp":
-        _pending_sub[frame["id"]] = frame
-    elif t == "wasi-resp":
-        _pending_wasi[frame["id"]] = frame
-    elif t == "pwa-resp":
-        _pending_pwa[frame["id"]] = frame
-    elif t == "host-resp":
-        _pending_host[frame["id"]] = frame
     elif t == "grant-bind":
         sid = frame.get("session") or ""
         grant = frame.get("grant") or ""
@@ -340,132 +324,75 @@ def _handle_rest(frame: dict) -> None:
 # ------------------------------------------------------------- net (vault)
 
 
+def _proxy_result(raw) -> dict:
+    """coincident returns a JsProxy; normalize to a plain dict."""
+    try:
+        return raw.to_py() if hasattr(raw, "to_py") else dict(raw)
+    except Exception:
+        return {"error": "unserializable proxy result"}
+
+
 def fetch_blocking(url: str, method: str, headers: dict, body_b64: str | None,
                    timeout_s: float = 120.0) -> dict:
-    """Synchronous-over-SAB fetch. Enqueues to the page; the page resolves
-    vault: grant handles against the key-vault worker and performs the
-    real fetch. The response arrives through the pump's ring drain."""
-    global _net_id
-    import browser_runtime
+    """Synchronous page-mediated fetch (coincident proxy call parks the
+    worker until the page resolves it). The page resolves vault: grant
+    handles against the key-vault worker and performs the real fetch —
+    key material never enters this interpreter."""
     import threading
 
-    _net_id += 1
-    req_id = _net_id
     # Turn threads are named `prompt-turn-<sid>`; the session's broker grant
     # travels with the request so vault enforces its handle scope.
     grant = ""
     tname = threading.current_thread().name or ""
     if tname.startswith("prompt-turn-"):
         grant = _session_grants.get(tname[len("prompt-turn-"):], "")
-    _js().fetchRequest(req_id, url, method, json.dumps(headers), body_b64 or "", grant)
-    deadline = __import__("time").monotonic() + timeout_s
-    while True:
-        if req_id in _pending_net:
-            resp = _pending_net.pop(req_id)
-            return resp
-        if __import__("time").monotonic() >= deadline:
-            return {"status": 599, "headers": {}, "body": "", "error": "fetch timeout"}
-        browser_runtime.pump(deadline)
+    resp = _proxy_result(
+        _js().fetchRequest(url, method, json.dumps(headers),
+                           body_b64 or "", grant))
+    resp.setdefault("status", 599)
+    resp.setdefault("headers", {})
+    resp.setdefault("body", "")
+    return resp
 
 
 def substrate_call(op: str, args: dict | None = None,
                    timeout_s: float = 60.0) -> dict:
-    """Synchronous-over-SAB extension substrate op. Enqueues a fixed-op
-    request to the page, which relays it to the Hermes substrate extension's
-    content-script bridge (grant-gated, audited, revocable there). The
-    response arrives through the pump's ring drain like net-resp."""
-    global _sub_id
-    import browser_runtime
-
-    _sub_id += 1
-    req_id = _sub_id
-    _js().substrateRequest(req_id, op, json.dumps(args or {}))
-    deadline = __import__("time").monotonic() + timeout_s
-    while True:
-        if req_id in _pending_sub:
-            resp = _pending_sub.pop(req_id)
-            inner = resp.get("result")
-            return inner if isinstance(inner, dict) else resp
-        if __import__("time").monotonic() >= deadline:
-            return {"error": "substrate timeout"}
-        browser_runtime.pump(deadline)
+    """Fixed-op extension substrate op. The page relays it to the Hermes
+    substrate extension's content-script bridge (grant-gated, audited,
+    revocable there); the sync proxy call returns the result directly."""
+    resp = _proxy_result(_js().substrateRequest(op, json.dumps(args or {})))
+    inner = resp.get("result")
+    return inner if isinstance(inner, dict) else resp
 
 
 def wasi_call(op: str, args: dict | None = None,
               timeout_s: float = 60.0) -> dict:
-    """Synchronous-over-SAB WASI-runner op (in-page, no extension needed).
-
-    Runs the plugin env's commands in the WASI userspace shipped with the
-    page (cowasm kernel + dash/coreutils wasm). `status`/`exec` are the ops;
-    the page answers `wasi-resp` through the pump's ring drain like net-resp.
-    """
-    global _wasi_id
-    import browser_runtime
-
-    _wasi_id += 1
-    req_id = _wasi_id
-    _js().wasiRequest(req_id, op, json.dumps(args or {}))
-    deadline = __import__("time").monotonic() + timeout_s
-    while True:
-        if req_id in _pending_wasi:
-            resp = _pending_wasi.pop(req_id)
-            inner = resp.get("result")
-            return inner if isinstance(inner, dict) else resp
-        if __import__("time").monotonic() >= deadline:
-            return {"error": "wasi timeout"}
-        browser_runtime.pump(deadline)
+    """In-page WASI-runner op (no extension needed). Runs the plugin env's
+    commands in the WASI userspace shipped with the page; `status`/`exec`
+    are the ops."""
+    resp = _proxy_result(_js().wasiRequest(op, json.dumps(args or {})))
+    inner = resp.get("result")
+    return inner if isinstance(inner, dict) else resp
 
 
 def pwa_call(op: str, args: dict | None = None,
              timeout_s: float = 60.0) -> dict:
-    """Synchronous-over-SAB PWA-grant op (in-page browser APIs).
-
-    Notifications, File System Access handles, mic/camera capture, wake lock
-    and periodic-sync registration live in the page (pwa-bridge.js), gated
-    by the browser's own permission model. Answers arrive as `pwa-resp`
-    through the pump's ring drain like the other substrate channels.
-    """
-    global _pwa_id
-    import browser_runtime
-
-    _pwa_id += 1
-    req_id = _pwa_id
-    _js().pwaRequest(req_id, op, json.dumps(args or {}))
-    deadline = __import__("time").monotonic() + timeout_s
-    while True:
-        if req_id in _pending_pwa:
-            resp = _pending_pwa.pop(req_id)
-            inner = resp.get("result")
-            return inner if isinstance(inner, dict) else resp
-        if __import__("time").monotonic() >= deadline:
-            return {"error": "pwa timeout"}
-        browser_runtime.pump(deadline)
+    """In-page PWA-grant op — notifications, File System Access, mic/camera,
+    wake lock, periodic sync (pwa-bridge.js), gated by the browser's own
+    permission model."""
+    resp = _proxy_result(_js().pwaRequest(op, json.dumps(args or {})))
+    inner = resp.get("result")
+    return inner if isinstance(inner, dict) else resp
 
 
 def host_call(op: str, args: dict | None = None,
               timeout_s: float = 60.0) -> dict:
-    """Synchronous-over-SAB local-host substrate op (opt-in T3).
-
-    Drives the companion host-agent.py the user runs on their own machine;
-    the page performs the localhost fetch with the vault-resolved pairing
-    token (host-bridge.js). Answers arrive as `host-resp` through the
-    pump's ring drain like the other substrate channels.
-    """
-    global _host_id
-    import browser_runtime
-
-    _host_id += 1
-    req_id = _host_id
-    _js().hostRequest(req_id, op, json.dumps(args or {}))
-    deadline = __import__("time").monotonic() + timeout_s
-    while True:
-        if req_id in _pending_host:
-            resp = _pending_host.pop(req_id)
-            inner = resp.get("result")
-            return inner if isinstance(inner, dict) else resp
-        if __import__("time").monotonic() >= deadline:
-            return {"error": "host timeout"}
-        browser_runtime.pump(deadline)
+    """Opt-in local-host substrate op (T3). Drives the companion
+    host-agent.py the user runs on their own machine; the page performs
+    the localhost fetch with the vault-resolved pairing token."""
+    resp = _proxy_result(_js().hostRequest(op, json.dumps(args or {})))
+    inner = resp.get("result")
+    return inner if isinstance(inner, dict) else resp
 
 
 def install() -> None:

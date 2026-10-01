@@ -45,6 +45,13 @@ for (const f of ['bootstrap.js', 'backend-worker.mjs', 'vault-worker.mjs', 'loca
   cpSync(join(root, 'src', f), join(out, f))
 }
 
+// coincident (MIT) — the sync worker<->page transport; self-contained dist
+// bundles, no transitive imports.
+mkdirSync(join(out, 'vendor'), { recursive: true })
+const coincidentDist = resolve(root, 'node_modules/coincident/dist')
+cpSync(join(coincidentDist, 'main.js'), join(out, 'vendor', 'coincident-main.js'))
+cpSync(join(coincidentDist, 'worker.js'), join(out, 'vendor', 'coincident-worker.js'))
+
 // Companion host agent (P6/T3 opt-in substrate) — downloadable from the site.
 try {
   cpSync(join(root, 'host-agent', 'host-agent.py'), join(out, 'host-agent.py'))
