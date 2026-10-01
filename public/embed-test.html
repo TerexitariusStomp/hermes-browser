@@ -1,0 +1,14 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>embed host</title></head>
+<body>
+<div id="chat" style="width:600px;height:500px"></div>
+<script src="./embed.js"></script>
+<script>
+  window.__TEST__ = (async () => {
+    const h = Hermes.mount('#chat')
+    await h.ready()
+    const pong = await h.call('gateway.ping', {})
+    return { pong }
+  })().then(r => ({ ok: true, ...r })).catch(e => ({ ok: false, error: String(e) }))
+</script>
+</body></html>

@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "coincident": "^4.1.1",
+    "penpal": "^7.0.6",
     "pyodide": "0.28.3"
   },
   "devDependencies": {

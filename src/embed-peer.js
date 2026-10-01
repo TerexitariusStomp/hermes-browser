@@ -23,12 +23,44 @@
   var host = framed ? window.parent : window.opener
   if (!host) return
 
-  var NS = 'hermes-embed'
   var hostOrigin = ''
   try { hostOrigin = new URL(document.referrer).origin } catch (e) { /* none */ }
 
-  function post(m) {
-    try { host.postMessage(Object.assign({ ns: NS, v: 1 }, m), hostOrigin || '*') } catch (e) { /* detached */ }
+  // penpal owns the postMessage handshake + origin validation + call
+  // matching. We expose exactly one method: `call(method, params)`, still
+  // consent-gated before touching the backend socket.
+  var remote = null
+  import('./vendor/penpal.mjs').then(function (mod) {
+    var messenger = new mod.WindowMessenger({
+      remoteWindow: host,
+      allowedOrigins: hostOrigin ? [hostOrigin] : undefined,
+    })
+    var conn = mod.connect({
+      messenger: messenger,
+      timeout: 60000,
+      methods: {
+        call: function (method, params) {
+          return ensureConsent().then(function (ok) {
+            if (!ok) throw new Error('embedder not granted')
+            return rpc(method, params)
+          })
+        },
+      },
+    })
+    conn.promise.then(function (r) {
+      remote = r
+      remote.emitEvent({ type: 'ready' })
+    }).catch(function (e) {
+      console.error('[embed-peer] penpal connect failed: ' + e)
+    })
+  }).catch(function (e) {
+    console.error('[embed-peer] penpal import failed: ' + e)
+  })
+
+  function emit(payload) {
+    if (remote) {
+      try { remote.emitEvent(payload) } catch (e) { /* detached */ }
+    }
   }
 
   // --- per-origin consent grants -------------------------------------------
@@ -120,7 +152,7 @@
         if (m.error) p.reject(new Error(m.error.message || 'rpc error'))
         else p.resolve(m.result)
       } else if (m.method === 'event') {
-        post({ t: 'event', payload: m.params })
+        emit(m.params)
       }
     }
     sock.onclose = function () {
@@ -144,33 +176,10 @@
     })
   }
 
-  // --- host channel -----------------------------------------------------------
-
-  window.addEventListener('message', function (ev) {
-    var m = ev.data
-    if (!m || m.ns !== NS || m.v !== 1) return
-    if (ev.source !== host) return
-    if (hostOrigin && ev.origin !== hostOrigin) return
-    if (m.t === 'init') {
-      post({ t: 'ready' })
-    } else if (m.t === 'call') {
-      var id = m.id
-      ensureConsent().then(function (ok) {
-        if (!ok) { post({ t: 'error', id: id, error: 'embedder not granted' }); return }
-        rpc(m.method, m.params).then(function (res) {
-          post({ t: 'result', id: id, result: res })
-        }, function (err) {
-          post({ t: 'error', id: id, error: String(err && err.message || err) })
-        })
-      })
-    }
-  })
-
-  post({ t: 'ready' })
   var readyTimer = setInterval(function () {
     if (window.__HERMES_BACKEND_READY__) {
       clearInterval(readyTimer)
-      post({ t: 'backend-ready' })
+      emit({ type: 'backend-ready' })
     }
   }, 500)
 })()

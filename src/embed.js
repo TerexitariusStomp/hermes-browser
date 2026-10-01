@@ -29,7 +29,6 @@
 (function () {
   'use strict'
 
-  var NS = 'hermes-embed'
   // Default target = the origin this script was served from — a self-hosted
   // copy embeds its own deployment without configuration.
   var DEFAULT_SRC = window.location.origin
@@ -48,35 +47,38 @@
     try { return new URL(base || DEFAULT_SRC).origin } catch (e) { return '*' }
   }
 
-  // One channel per attached surface (iframe or popup): owns the postMessage
-  // listener, pending call map, and event subscribers.
-  function Channel(targetWin, base) {
-    this.win = targetWin
-    this.origin = originOf(base)
-    this.nextId = 1
-    this.pending = {}
+  // One channel per attached surface (iframe): penpal owns the postMessage
+  // handshake, origin validation, call/response matching and teardown.
+  // The remote side exposes `call(method, params)` (consent-gated there)
+  // and we expose `emitEvent(payload)` for backend event fan-out.
+  // Resolve against the agent origin — embed.js runs in the HOST page's
+  // document, where a bare relative import would hit the wrong origin.
+  var penpalP = import(new URL('./vendor/penpal.mjs', DEFAULT_SRC + '/').href)
+
+  function Channel(frame, base) {
+    var self = this
     this.handlers = { event: [] }
     this.readyPromise = null
-    this._onMessage = this._onMessage.bind(this)
-    window.addEventListener('message', this._onMessage)
-  }
-  Channel.prototype._onMessage = function (ev) {
-    var m = ev.data
-    if (!m || m.ns !== NS) return
-    if (ev.source !== this.win) return
-    if (ev.origin !== this.origin && this.origin !== '*') return
-    if (m.t === 'ready' || m.t === 'backend-ready') {
-      if (this._readyResolve && m.t === 'backend-ready') this._readyResolve(this)
-      this._emit('event', { type: m.t })
-    } else if (m.t === 'result' || m.t === 'error') {
-      var p = this.pending[m.id]
-      if (!p) return
-      delete this.pending[m.id]
-      if (m.t === 'error') p.reject(new Error(m.error || 'call failed'))
-      else p.resolve(m.result)
-    } else if (m.t === 'event') {
-      this._emit('event', m.payload)
-    }
+    this._readyResolve = null
+    this.origin = originOf(base)
+    this._remoteP = penpalP.then(function (mod) {
+      var messenger = new mod.WindowMessenger({
+        remoteWindow: frame.contentWindow,
+        allowedOrigins: self.origin === '*' ? undefined : [self.origin],
+      })
+      self._conn = mod.connect({
+        messenger: messenger,
+        methods: {
+          emitEvent: function (payload) {
+            if (payload && payload.type === 'backend-ready' && self._readyResolve) {
+              self._readyResolve(self)
+            }
+            self._emit('event', payload)
+          },
+        },
+      })
+      return self._conn.promise
+    })
   }
   Channel.prototype._emit = function (name, payload) {
     var fns = this.handlers[name] || []
@@ -84,15 +86,9 @@
       try { fns[i](payload) } catch (e) { /* host handler errors are theirs */ }
     }
   }
-  Channel.prototype._send = function (m) {
-    this.win.postMessage(Object.assign({ ns: NS, v: 1 }, m), this.origin)
-  }
   Channel.prototype.call = function (method, params) {
-    var self = this
-    return new Promise(function (resolve, reject) {
-      var id = 'e' + self.nextId++
-      self.pending[id] = { resolve: resolve, reject: reject }
-      self._send({ t: 'call', id: id, method: method, params: params || {} })
+    return this._remoteP.then(function (remote) {
+      return remote.call(method, params || {})
     })
   }
   Channel.prototype.prompt = function (sessionId, text) {
@@ -115,18 +111,11 @@
     }
     return this.readyPromise
   }
-  Channel.prototype._failAll = function (reason) {
-    for (var id in this.pending) {
-      this.pending[id].reject(new Error(reason))
-      delete this.pending[id]
-    }
-    this._emit('event', { type: 'closed', reason: reason })
-  }
   Channel.prototype.unmount = function () {
-    window.removeEventListener('message', this._onMessage)
+    if (this._conn) this._conn.destroy()
     var el = this.el
     if (el && el.parentNode) el.parentNode.removeChild(el)
-    this._failAll('unmounted')
+    this._emit('event', { type: 'closed', reason: 'unmounted' })
   }
 
   function openPopup(base) {
@@ -203,7 +192,7 @@
     }
     var frame = makeFrame(opts.src)
     el.appendChild(frame)
-    var ch = new Channel(frame.contentWindow, opts.src)
+    var ch = new Channel(frame, opts.src)
     ch.el = frame
     return ch
   }
@@ -245,7 +234,7 @@
       if (open && !ch) {
         var frame = makeFrame(opts.src)
         panel.appendChild(frame)
-        ch = new Channel(frame.contentWindow, opts.src)
+        ch = new Channel(frame, opts.src)
         ch.el = frame
         if (opts.onEvent) ch.on('event', opts.onEvent)
       }

@@ -52,6 +52,10 @@ const coincidentDist = resolve(root, 'node_modules/coincident/dist')
 cpSync(join(coincidentDist, 'main.js'), join(out, 'vendor', 'coincident-main.js'))
 cpSync(join(coincidentDist, 'worker.js'), join(out, 'vendor', 'coincident-worker.js'))
 
+// penpal (MIT) — embed iframe postMessage RPC; self-contained ESM bundle.
+cpSync(resolve(root, 'node_modules/penpal/dist/penpal.mjs'),
+  join(out, 'vendor', 'penpal.mjs'))
+
 // Companion host agent (P6/T3 opt-in substrate) — downloadable from the site.
 try {
   cpSync(join(root, 'host-agent', 'host-agent.py'), join(out, 'host-agent.py'))
@@ -138,10 +142,13 @@ cpSync(resolve(root, 'public'), out, { recursive: true })
 // Embeddable: any https page (and localhost dev) may frame the app — vault
 // stays on this origin, and embed-peer.js consent-gates host API calls. CORP
 // is cross-origin so the frameable document isn't blocked by COEP-era checks.
+// Static assets are public; ACAO lets the embed host's dynamic import of
+// vendor/penpal.mjs (a CORS-mode module fetch) succeed cross-origin.
 writeFileSync(join(out, '_headers'), `/*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
   Cross-Origin-Resource-Policy: cross-origin
+  Access-Control-Allow-Origin: *
   Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' blob:; worker-src 'self' blob:; connect-src 'self' https: wss:; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors https: http://localhost:* http://127.0.0.1:*
 `)
 writeFileSync(join(out, 'overlay', 'manifest.json'), JSON.stringify(
