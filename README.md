@@ -45,9 +45,10 @@ The vendored tree is never edited — all browser adaptation lives in `src/`.
 | `browser_runtime.py` | Cooperative scheduler + threading/asyncio shims that make the stock synchronous core survivable under Pyodide |
 | `browser_bootstrap.py` | Pyodide env setup; httpx/urllib3/urllib → page-fetch transports |
 | `py_gateway.py` | In-process host for the real REST app + `tui_gateway` ws dispatch; page-bridge bus (`net`/`wasi`/`pwa`/`host`/`ext` channels) |
-| `bootstrap.js` | Page side: SAB ring writer (framed, fragmented, back-pressured), fetch/ws shims, vault mediation, share/embed wiring |
-| `backend-worker.mjs` | Pyodide host worker; ring reader + fragment reassembly |
-| `vault-worker.mjs` | Secrets boundary: AES-GCM in IndexedDB under a non-extractable device key; page sees only `vault:<handle>` tokens; scoped revocable grants |
+| `bootstrap.js` | Page side: coincident transport, fetch/ws shims, vault mediation, grant binding, share/embed wiring |
+| `backend-worker.mjs` | Pyodide host worker; `pullInbound` frame pump + sync proxy calls into the page |
+| `vault-worker.mjs` | Secrets boundary transport wrapper — ops live in `vault-ops.mjs` |
+| `vault-ops.mjs` | Vault logic: AES-GCM in IndexedDB under a non-extractable device key; page sees only `vault:<handle>` tokens; scoped revocable grants with parent-chain resolution |
 | `plugins/hermes_browser/` | Plugin payload installed to `~/.hermes/plugins/` at boot: `wasi` + `local_host` terminal env providers, `pwa` + `browser_ext` toolsets |
 | `wasi-runner.mjs` | container2wasm Debian userspace (real `bash`, coreutils) for `terminal`/`process_manage` |
 | `pwa-bridge.js` | Browser-grant capability bridge (Notification, FSA, getUserMedia, Web Speech, WakeLock, periodic-sync) |
@@ -59,9 +60,15 @@ The vendored tree is never edited — all browser adaptation lives in `src/`.
 ## Security model
 
 - **Secret custody**: BYOK keys, the host-agent token, and session tokens are
-  stored only inside `vault-worker.mjs` (AES-GCM, non-extractable device key).
-  Python code and page JS see `vault:<handle>` placeholders; resolution
-  happens inside the worker at fetch time against scoped, revocable grants.
+  stored only inside `vault-ops.mjs`'s IndexedDB stores (AES-GCM,
+  non-extractable device key). Python code and page JS see `vault:<handle>`
+  placeholders; resolution happens inside the worker at fetch time against
+  scoped, revocable grants.
+- **Sessions are key domains**: each `session.create` mints a grant parented
+  to the "shared" tier (secrets written outside a session context). A secret
+  written inside a session is attributed to that session's grant only — no
+  other session resolves it. Remote share sessions sub-grant under the share
+  broker and can never climb into the local secret domain.
 - **Origin scoping**: `embed-peer.js` requires an explicit Allow/Deny grant
   per embedder origin; the relay (`relay/`) mints sessions only from
   allowlisted origins and stores only sha256 token hashes.
@@ -70,7 +77,10 @@ The vendored tree is never edited — all browser adaptation lives in `src/`.
   page-supplied code.
 - **Relay is honest**: `relay/` holds in-memory socket state only. A fully
   compromised relay can drop or mangle frames but cannot mint sessions or
-  reach secrets.
+  reach secrets. With an E2E client (`/api/e2e-ws`, `POST /api/e2e`, or the
+  `e2e-shim.mjs` loopback front for stock clients) the relay sees only
+  AES-GCM ciphertext — the key ships in the share URL's `#k=` fragment and
+  never transits the wire.
 
 ## Remote gateway
 
@@ -80,6 +90,13 @@ Remote Hermes Desktop / CLI clients then reach this browser-hosted agent via
 the stock remote-gateway contract (`baseUrl` + `X-Hermes-Session-Token` /
 `wss` JSON-RPC). Set `window.__HERMES_RELAY_URL__` or
 `localStorage['hermes.relayUrl']` to point at your relay.
+
+`startShare` returns both the stock `baseUrl`/`token` and an E2E `shareUrl`
+(key in the `#k=` fragment). For relay-blind sharing, run
+`node relay/scripts/e2e-shim.mjs "<shareUrl>"` on the client machine — it
+serves the stock gateway surface on loopback, encrypting both directions so
+the relay pipes ciphertext only. Stock clients pointed at `baseUrl` directly
+still work in plaintext.
 
 ## Embedding
 
