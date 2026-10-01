@@ -34,7 +34,35 @@ import json
 import os
 import sys
 import time
-import urllib.parse
+import httpx
+from starlette.websockets import WebSocketDisconnect
+
+# httpx-ws subclasses anyio.AsyncContextManagerMixin at import time; anyio
+# 4.9 removed the deprecated mixin. Reproduce it faithfully: __aenter__
+# delegates to the subclass's __asynccontextmanager__ (where httpx-ws builds
+# its streams/task group) — a plain "return self" shim would skip that.
+import anyio  # noqa: E402
+
+if not hasattr(anyio, "AsyncContextManagerMixin"):
+    import contextlib
+
+    class _AsyncContextManagerMixin:
+        @contextlib.asynccontextmanager
+        async def __asynccontextmanager__(self):
+            yield self
+
+        async def __aenter__(self):
+            self.__cm = self.__asynccontextmanager__()
+            return await self.__cm.__aenter__()
+
+        async def __aexit__(self, exc_type, exc_value, tb):
+            return await self.__cm.__aexit__(exc_type, exc_value, tb)
+
+    anyio.AsyncContextManagerMixin = _AsyncContextManagerMixin
+
+import httpx_ws  # noqa: E402
+import httpx_ws.transport  # noqa: E402
+
 
 
 def _js():
@@ -43,7 +71,7 @@ def _js():
     return js.hermesBridge
 
 
-_sockets: dict[int, "_FakeWS"] = {}
+_sockets: dict[int, "asyncio.Queue"] = {}
 # Broker-grant bindings minted page-side at session.create; fetches on a
 # `prompt-turn-<sid>` thread carry that session's grant so the vault worker
 # enforces its scope (remote sub-grants resolve a strict subset of handles).
@@ -54,110 +82,67 @@ _session_token = ""
 _public_host = ""
 
 
-class _Client:
-    host = "127.0.0.1"
-    port = 0
-
-
-class _FakeWS:
-    """Duck-typed WebSocket for tui_gateway.ws.handle_ws.
-
-    Implements the exact surface handle_ws/WSTransport touch:
-    accept(), receive_text() (raises WebSocketDisconnect on close),
-    send_text(), close(), .client/.scope/.app attributes — plus the
-    headers/query_params/url reads the upstream pre-accept guard
-    (_close_unless_sidecar_allowed) performs.
-    """
-
-    def __init__(self, ws_id: int, path: str = "/", headers: dict | None = None):
-        self.ws_id = ws_id
-        self.client = _Client()
-        self.scope = {"type": "websocket", "extensions": {}}
-        self.app = _app
-        parsed = urllib.parse.urlsplit(path)
-        self.url = parsed
-        self.query_params = {
-            k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()
-        }
-        self.headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
-        self._inq: asyncio.Queue = asyncio.Queue()
-        self._accepted = False
-        self._closed = False
-
-    async def accept(self, subprotocol=None):
-        self._accepted = True
-        _js().wsAccepted(self.ws_id)
-
-    async def receive_text(self) -> str:
-        item = await self._inq.get()
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    async def send_text(self, text: str) -> None:
-        if self._closed:
-            raise RuntimeError("socket closed")
-        _js().emit(self.ws_id, text)
-
-    async def close(self, code: int = 1000, reason: str = "") -> None:
-        if self._closed:
-            return
-        self._closed = True
-        _js().wsClosed(self.ws_id, code, reason)
-
-    # feed side (sync callers)
-    def feed_text(self, text: str) -> None:
-        self._inq.put_nowait(text)
-
-    def feed_disconnect(self, code: int = 1000, reason: str = "") -> None:
-        from starlette.websockets import WebSocketDisconnect
-
-        self._closed = True
-        self._inq.put_nowait(WebSocketDisconnect(code=code, reason=reason))
-
-
 # --------------------------------------------------------------- socket glue
+#
+# Each page-side socket is an in-memory queue of inbound frames; a task
+# drives the REAL upstream /api/ws ASGI route through httpx-ws (the same
+# accept/guard/handle_ws path the dashboard's own websocket hits — no
+# mirrored pre-accept logic here). Page frames queue -> aws.send_text;
+# aws.receive_text -> emit() back to the page.
 
 
 def ws_open(ws_id: int, path: str, headers: dict | None = None) -> None:
-    ws = _FakeWS(ws_id, path, headers)
-    _sockets[ws_id] = ws
+    q: asyncio.Queue = asyncio.Queue()
+    _sockets[ws_id] = q
     import browser_runtime
 
     async def _run():
-        from tui_gateway.ws import handle_ws
-
+        loop = browser_runtime.get_loop()
+        code, reason = 1000, ""
         try:
-            # The real upstream pre-accept guard chain: chat-enabled check,
-            # credential check (token vs _SESSION_TOKEN in legacy mode), and
-            # the Host/Origin/peer DNS-rebinding gates.
-            from hermes_cli.web_routers.chat_ws import (
-                _close_unless_sidecar_allowed)
+            transport = httpx_ws.transport.ASGIWebSocketTransport(app=_app)
+            async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://browser.local") as client:
+                async with httpx_ws.aconnect_ws(
+                        path, client, headers=headers or {}) as aws:
+                    _js().wsAccepted(ws_id)
 
-            if not await _close_unless_sidecar_allowed(
-                    ws, allow_internal=True):
-                return
-            # Mirror gateway_ws's prelude: first chat client arms deferred
-            # MCP discovery.
-            try:
-                from hermes_cli.mcp_startup import start_deferred_mcp_discovery_now
+                    async def _outbound():
+                        while True:
+                            item = await q.get()
+                            if isinstance(item, BaseException):
+                                raise item
+                            await aws.send_text(item)
 
-                await asyncio.to_thread(start_deferred_mcp_discovery_now)
-            except Exception:
-                pass
-            await handle_ws(
-                ws,
-                auth_identity=getattr(ws, "_hermes_auth_identity", None),
-                subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
-            )
-        except Exception:
+                    async def _inbound():
+                        while True:
+                            _js().emit(ws_id, await aws.receive_text())
+
+                    tasks = [
+                        asyncio.Task(_outbound(), loop=loop),
+                        asyncio.Task(_inbound(), loop=loop),
+                    ]
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_EXCEPTION)
+                    for t in pending:
+                        t.cancel()
+                    for t in done:
+                        exc = t.exception()
+                        if isinstance(exc, WebSocketDisconnect):
+                            code, reason = exc.code, exc.reason or ""
+                        elif exc is not None:
+                            raise exc
+        except WebSocketDisconnect as e:
+            code, reason = e.code, e.reason or ""
+        except BaseException:  # noqa: BLE001
             import traceback
 
             traceback.print_exc()
-            try:
-                await ws.close(code=1011)
-            except Exception:
-                pass
+            _js().log("err", f"ws_open {ws_id}: {sys.exc_info()[1]!r}")
+            code, reason = 1011, ""
+        _sockets.pop(ws_id, None)
+        _js().wsClosed(ws_id, code, reason)
 
     try:
         asyncio.Task(_run(), loop=browser_runtime.get_loop())
@@ -169,16 +154,16 @@ def ws_open(ws_id: int, path: str, headers: dict | None = None) -> None:
 
 
 def ws_close(ws_id: int) -> None:
-    ws = _sockets.pop(ws_id, None)
-    if ws is not None:
-        ws.feed_disconnect()
+    q = _sockets.pop(ws_id, None)
+    if q is not None:
+        q.put_nowait(WebSocketDisconnect(code=1000, reason="page closed"))
 
 
 def ws_send(ws_id: int, data: str) -> None:
-    ws = _sockets.get(ws_id)
-    if ws is None:
+    q = _sockets.get(ws_id)
+    if q is None:
         return
-    ws.feed_text(data)
+    q.put_nowait(data)
 
 
 def _route_pump_frame(frame: dict) -> None:
@@ -216,14 +201,12 @@ def handle(raw: str) -> None:
 def _handle_rest(frame: dict) -> None:
     """Route a page REST request through the real FastAPI app.
 
-    The scope mimics uvicorn's: http.request delivers the buffered body once,
-    send() collects response.start + body chunks. Headers pass through
-    verbatim — the renderer already attaches X-Hermes-Session-Token.
+    httpx.ASGITransport drives the real app in-process — headers pass
+    verbatim (the renderer already attaches X-Hermes-Session-Token).
     """
     rid = frame["id"]
     method = frame.get("method", "GET")
     raw_path = frame.get("path", "/")
-    parsed = urllib.parse.urlsplit(raw_path)
     headers = frame.get("headers") or {}
     body = frame.get("body") or {}
     if "b64" in body:
@@ -231,60 +214,22 @@ def _handle_rest(frame: dict) -> None:
     else:
         body_bytes = (body.get("text") or "").encode()
 
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": method,
-        "scheme": "http",
-        "path": parsed.path,
-        "raw_path": parsed.path.encode(),
-        "query_string": parsed.query.encode(),
-        "root_path": "",
-        "headers": [
-            (str(k).lower().encode(), str(v).encode()) for k, v in headers.items()
-        ],
-        "client": ("127.0.0.1", 0),
-        "server": ("127.0.0.1", 0),
-        "app": _app,
-    }
-
-    state = {"sent": False}
-    status_headers: dict = {}
-    chunks: list[bytes] = []
-
-    async def receive():
-        if not state["sent"]:
-            state["sent"] = True
-            return {"type": "http.request", "body": body_bytes, "more_body": False}
-        return {"type": "http.disconnect"}
-
-    async def send(msg):
-        t = msg["type"]
-        if t == "http.response.start":
-            status_headers["status"] = msg["status"]
-            status_headers["headers"] = dict(msg.get("headers") or [])
-        elif t == "http.response.body":
-            chunks.append(msg.get("body", b""))
-        elif t == "http.response.debug":
-            pass
-
     async def _invoke():
-        await _app(scope, receive, send)
+        transport = httpx.ASGITransport(app=_app)
+        async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://browser.local") as client:
+            return await client.request(
+                method, raw_path, headers=headers, content=body_bytes)
 
-    def _reply():
-        body_out = b"".join(chunks)
+    def _reply(resp):
         # postMessage can't structured-clone a PyProxy — headers cross as
-        # JSON. ASGI delivers them as (bytes, bytes) pairs — decode first.
-        hdrs = {}
-        for k, v in (status_headers.get("headers") or {}).items():
-            kk = k.decode() if isinstance(k, bytes) else str(k)
-            hdrs[kk] = v.decode() if isinstance(v, bytes) else str(v)
+        # JSON. httpx.Headers is already str->str.
         _js().restReply(
             rid,
-            status_headers.get("status", 500),
-            json.dumps(hdrs),
-            base64.b64encode(body_out).decode(),
+            resp.status_code,
+            json.dumps(dict(resp.headers)),
+            base64.b64encode(resp.content).decode(),
         )
 
     import browser_runtime
@@ -301,7 +246,7 @@ def _handle_rest(frame: dict) -> None:
                     {"detail": f"internal error: {exc}"}).encode()).decode())
             return
         try:
-            _reply()
+            _reply(task.result())
         except Exception:  # noqa: BLE001
             traceback.print_exc()
 

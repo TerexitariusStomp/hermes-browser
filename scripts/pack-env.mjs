@@ -31,6 +31,8 @@ const DEPS = [
   // typing-extensions must satisfy fastapi's floor before it resolves.
   'typing-extensions>=4.15.0', 'starlette', 'anyio', 'python-multipart',
   'itsdangerous', 'sse-starlette', 'fastapi',
+  // in-process ASGI client for the REST+WS surface (pure python: wsproto/h11)
+  'httpx-ws',
   // pyodide-tagged binary wheels micropip can resolve
   'Pillow',
 ]
