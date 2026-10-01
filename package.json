@@ -26,6 +26,7 @@
     "@wasmer/sdk": "0.19.0",
     "@wllama/wllama": "3.6.1",
     "esbuild": "^0.25.0",
+    "fake-indexeddb": "^6.2.5",
     "playwright": "1.63.0"
   }
 }

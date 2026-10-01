@@ -10,6 +10,8 @@
  */
 import { WebSocket } from 'ws'
 import { execFile } from 'node:child_process'
+import crypto from 'node:crypto'
+import { serve as serveShim, enc, dec, importKey } from './e2e-shim.mjs'
 
 const BASE = process.argv[2] || 'http://localhost:8787'
 const WS_BASE = BASE.replace(/^http/, 'ws')
@@ -126,6 +128,66 @@ async function main() {
   client.close()
   await new Promise((r) => setTimeout(r, 1500))
   check('client close -> ws-close frame', closes.some((f) => f.t === 'ws-close' && f.cid === cid))
+
+  // 6c. E2E channel — stock client traffic rides ciphertext through the
+  //     DO. A local shim exposes the stock surface on loopback; the fake
+  //     agent here plays the browser's decrypt/dispatch/re-encrypt role.
+  const e2eKeyRaw = crypto.randomBytes(32)
+  const e2eKey = await importKey(e2eKeyRaw)
+  const shareUrl = `${BASE}/s/${sess.sid}?token=${sess.clientToken}#k=${e2eKeyRaw.toString('base64url')}`
+  const shim = await serveShim(shareUrl, '127.0.0.1:8790')
+
+  // ws: stock client -> shim -> relay -> agent (ciphertext frames)
+  const e2eOpenPromise = nextMsg(agent)
+  const e2eClient = await wsOpen('ws://127.0.0.1:8790/api/ws')
+  const e2eOpen = await e2eOpenPromise
+  check('e2e ws-open forwarded with path', e2eOpen.t === 'ws-open' && e2eOpen.path === '/api/e2e-ws')
+  const ecid = e2eOpen.cid
+  agent.send(JSON.stringify({ t: 'ws-opened', cid: ecid }))
+  const e2eFwdPromise = nextMsg(agent)
+  e2eClient.send('{"jsonrpc":"2.0","id":7,"method":"gateway.ping","params":{}}')
+  const e2eFwd = await e2eFwdPromise
+  const e2eCt = Buffer.from(e2eFwd.data || '', 'base64')
+  check('e2e ws-msg arrived ciphertext-only',
+    e2eFwd.t === 'ws-msg' && e2eFwd.cid === ecid &&
+    !e2eCt.includes(Buffer.from('gateway.ping')) && !e2eCt.includes(Buffer.from('jsonrpc')))
+  const e2eInner = (await dec(e2eKey, e2eCt)).toString()
+  check('agent decrypts e2e ws payload', e2eInner.includes('gateway.ping'))
+  agent.send(JSON.stringify({
+    t: 'ws-msg', cid: ecid,
+    data: (await enc(e2eKey, '{"jsonrpc":"2.0","id":7,"result":{"ok":true}}')).toString('base64'),
+  }))
+  const e2eClientMsg = await new Promise((res, rej) => {
+    const to = setTimeout(() => rej(new Error('e2e client timeout')), 8000)
+    e2eClient.once('message', (d) => { clearTimeout(to); res(d.toString()) })
+  })
+  check('e2e round-trip decrypts at client', e2eClientMsg.includes('"ok":true'))
+
+  // REST: client -> shim -> POST /api/e2e (opaque) -> agent decrypts.
+  // ws-close for the e2e client may interleave here — skip until 'rest'.
+  const e2eRestPromise = fetch('http://127.0.0.1:8790/api/config?probe=1')
+  let e2eRestFrame = null
+  for (let i = 0; i < 5; i++) {
+    const f = await nextMsg(agent)
+    if (f.t === 'rest') { e2eRestFrame = f; break }
+  }
+  const e2eRestCt = Buffer.from(e2eRestFrame.bodyB64 || '', 'base64')
+  check('e2e rest envelope is opaque to relay',
+    e2eRestFrame.t === 'rest' && e2eRestFrame.path === '/api/e2e' &&
+    e2eRestFrame.method === 'POST' && !e2eRestCt.includes(Buffer.from('/api/config')))
+  const innerRest = JSON.parse((await dec(e2eKey, e2eRestCt)).toString())
+  check('e2e rest inner request decrypts', innerRest.method === 'GET' && innerRest.path === '/api/config?probe=1')
+  agent.send(JSON.stringify({
+    t: 'rest-res', id: e2eRestFrame.id, status: 200,
+    headers: { 'content-type': 'application/octet-stream' },
+    bodyB64: (await enc(e2eKey, JSON.stringify({
+      status: 200, headers: { 'content-type': 'application/json' }, bodyB64: btoa('{"ok":1}'),
+    }))).toString('base64'),
+  }))
+  const e2eRestResp = await e2eRestPromise
+  check('e2e rest round-trip', e2eRestResp.status === 200 && (await e2eRestResp.text()) === '{"ok":1}')
+  e2eClient.readyState === 1 && e2eClient.close()
+  shim.close()
 
   // 8. teardown
   const del = await fetch(`${BASE}/s/${sess.sid}?token=${sess.agentToken}`, { method: 'DELETE' })

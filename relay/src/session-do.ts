@@ -15,6 +15,9 @@
  * - A fully compromised relay can drop or corrupt frames, but cannot mint
  *   sessions (tokens are per-session random, only hashes are stored), cannot
  *   recover secrets, and cannot impersonate the agent (agent token hash).
+ *   Clients on /api/e2e-ws + POST /api/e2e additionally get ciphertext-only
+ *   payloads here (AES-GCM keyed off the share URL fragment, which never
+ *   transits the relay) — the DO routes them blind by cid/id.
  *
  * Frame protocol (JSON text on the agent socket):
  *   DO -> agent:  {t:'ws-open',cid,path} {t:'ws-msg',cid,data}
@@ -45,6 +48,7 @@ interface PendingRest {
 
 interface ConnState {
   role: 'agent' | 'client'
+  path?: string
 }
 
 interface Env {
@@ -157,8 +161,10 @@ export class HermesSessionDO extends Server<Env> {
       return super.fetch(request)
     }
 
-    // Stock client ws: GET /api/ws?token=<clientToken>
-    if (path === '/api/ws') {
+    // Stock client ws: GET /api/ws?token=<clientToken>. /api/e2e-ws is the
+    // same upgrade for ciphertext-channel clients — identical gate; the
+    // path is forwarded in ws-open so the agent marks the cid E2E.
+    if (path === '/api/ws' || path === '/api/e2e-ws') {
       const token = url.searchParams.get('token') || ''
       if (!(await this.hashOk(token, 'clientHash'))) return json(401, { error: 'bad_token' })
       if (!this.agentConn()) return json(503, { error: 'agent_not_connected' })
@@ -173,8 +179,9 @@ export class HermesSessionDO extends Server<Env> {
 
   /** Tag + role-stamp each accepted socket from the upgrade path. */
   getConnectionTags(connection: Connection<ConnState>, ctx: ConnectionContext): string[] {
-    const role = new URL(ctx.request.url).pathname === '/agent' ? 'agent' : 'client'
-    connection.setState({ role })
+    const path = new URL(ctx.request.url).pathname
+    const role = path === '/agent' ? 'agent' : 'client'
+    connection.setState({ role, path })
     return [role]
   }
 
@@ -182,7 +189,7 @@ export class HermesSessionDO extends Server<Env> {
     if (connection.state?.role !== 'client') return
     // Messages arriving before the agent acks (ws-opened) queue here.
     this.openQueue.set(connection.id, [])
-    this.sendToAgent({ t: 'ws-open', cid: connection.id, path: '/api/ws' })
+    this.sendToAgent({ t: 'ws-open', cid: connection.id, path: connection.state?.path || '/api/ws' })
   }
 
   /** Non-upgrade surface: init, status, teardown, and the REST bridge. */

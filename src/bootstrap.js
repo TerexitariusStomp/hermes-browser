@@ -132,16 +132,38 @@
 
   // Mint a broker grant for a freshly created agent session, then bind it
   // worker-side so fetches on `prompt-turn-<sid>` carry the grant id.
-  // Local sessions get full authority ('*', revocable); remote share clients
-  // get a sub-grant of the share broker grant — default-deny on secrets.
-  function bindSessionGrant(sid, isRemote) {
-    var spec = isRemote
-      ? { kind: 'remote', session_id: sid, parent: share && share.grant || null, handles: [] }
-      : { kind: 'session', session_id: sid, handles: '*' }
-    vaultCall('createGrant', spec).then(function (r) {
-      if (r && r.grant) {
-        postToWorker({ t: 'grant-bind', session: sid, grant: r.grant })
-      }
+  // Sessions are separate key domains: local sessions parent to the shared
+  // grant (inheriting secrets written outside a session context), remote
+  // sessions parent to the share broker grant — never the shared tier. A
+  // secret written inside a session is added to that session's grant only.
+  var sessionGrants = {}    // session_id -> grant id
+  var sockGrants = {}       // socketId -> grant id (that socket's session)
+  var sharedGrantPromise = null
+
+  function sharedGrant() {
+    if (!sharedGrantPromise) {
+      sharedGrantPromise = vaultCall('createGrant', { kind: 'shared', handles: [] })
+        .then(function (r) { return (r && r.grant) || null })
+      sharedGrantPromise.catch(function () { sharedGrantPromise = null })
+    }
+    return sharedGrantPromise
+  }
+
+  function bindSessionGrant(sid, isRemote, sockId) {
+    var specP = isRemote
+      ? Promise.resolve({ kind: 'remote', session_id: sid, parent: share && share.grant || null, handles: [] })
+      : sharedGrant().then(function (sg) {
+          return { kind: 'session', session_id: sid, parent: sg, handles: [] }
+        })
+    specP.then(function (spec) {
+      if (!spec) return
+      return vaultCall('createGrant', spec).then(function (r) {
+        if (r && r.grant) {
+          sessionGrants[sid] = r.grant
+          if (sockId !== undefined) sockGrants[sockId] = r.grant
+          postToWorker({ t: 'grant-bind', session: sid, grant: r.grant })
+        }
+      })
     })
   }
 
@@ -153,7 +175,7 @@
     var method = rpcMethods[sockId + ':' + m.id]
     delete rpcMethods[sockId + ':' + m.id]
     if (method === 'session.create' && m.result && m.result.session_id) {
-      bindSessionGrant(m.result.session_id, remoteSocks[sockId] !== undefined)
+      bindSessionGrant(m.result.session_id, remoteSocks[sockId] !== undefined, sockId)
     }
   }
 
@@ -168,8 +190,25 @@
   function onWorkerMessage(ev) {
     var msg = ev.data
     if (msg.type === 'fetch-response' && remoteRest[msg.id] !== undefined) {
-      var rid = remoteRest[msg.id]
+      var rr = remoteRest[msg.id]
       delete remoteRest[msg.id]
+      // E2E entries hold {id, e2e}; plaintext entries hold the bare relay id.
+      var rid = typeof rr === 'object' ? rr.id : rr
+      if (rr && rr.e2e && share && share.key) {
+        e2eEncrypt(share.key, JSON.stringify({
+          status: msg.status, headers: msg.headers, bodyB64: msg.bodyB64,
+        })).then(function (ct) {
+          // Real status/headers ride inside the ciphertext; the visible
+          // envelope is a constant 200/octet-stream so the DO can't even
+          // glean response codes.
+          shareSend({
+            t: 'rest-res', id: rid, status: 200,
+            headers: { 'content-type': 'application/octet-stream' },
+            bodyB64: ct,
+          })
+        })
+        return
+      }
       shareSend({ t: 'rest-res', id: rid, status: msg.status, headers: msg.headers, bodyB64: msg.bodyB64 })
       return
     }
@@ -549,6 +588,8 @@
         this._fire('message', { data: msg.data })
       } else if (msg.event === 'close') {
         this.readyState = 3
+        delete sockGrants[this._id]
+        delete sockets[this._id]
         this._fire('close', { code: msg.code || 1000, reason: msg.reason || '', wasClean: true })
       } else if (msg.event === 'error') {
         this._fire('error', {})
@@ -564,6 +605,17 @@
     var copies = fields.filter(function (f) { return parsed.params && typeof parsed.params[f] === 'string' })
     if (!copies.length) return null
     var isRemote = sockId !== undefined && remoteSocks[sockId] !== undefined
+    // Attribute each stored handle to the writer's own session grant — the
+    // grant this socket's session.create minted, or the session named in
+    // params. A write with no session context falls to the shared tier
+    // locally (all local sessions inherit it) or the share broker grant
+    // remotely (all remote sub-grants inherit it — the old behavior).
+    var writerGrant =
+      (parsed.params && sessionGrants[parsed.params.session_id]) ||
+      sockGrants[sockId] || null
+    var fallbackP = isRemote
+      ? Promise.resolve(share && share.grant)
+      : sharedGrant()
     console.log('[vault] storeSecret for ' + parsed.method + ' fields=' + copies.join(','))
     return Promise.all(copies.map(function (f) {
       return vaultCall('storeSecret', { value: parsed.params[f], label: parsed.method + ':' + f })
@@ -571,15 +623,10 @@
           // Never forward the raw secret — a failed store becomes an explicit
           // dead placeholder so downstream resolution fails loudly.
           parsed.params[f] = resp && resp.handle ? 'vault:' + resp.handle : 'vault:unavailable'
-          // Remote-sourced secrets belong to the remote grants' scope —
-          // they were never the browser's own to begin with.
-          if (isRemote && resp && resp.handle) {
-            vaultCall('grantAddHandle', { grant: share.grant, handle: resp.handle })
-            vaultCall('listGrants').then(function (r) {
-              ;(r && r.grants || []).forEach(function (g) {
-                if (g.parent === share.grant && !g.revoked)
-                  vaultCall('grantAddHandle', { grant: g.grant, handle: resp.handle })
-              })
+          if (resp && resp.handle) {
+            var g = writerGrant
+            ;(g ? Promise.resolve(g) : fallbackP).then(function (grant) {
+              if (grant) vaultCall('grantAddHandle', { grant: grant, handle: resp.handle })
             })
           }
         })
@@ -735,11 +782,63 @@
   // same worker frames the local webapp uses — upstream code sees a stock
   // sidecar socket, the relay sees only opaque envelopes. Secret writes
   // from remote clients get the same vault interception as local ones.
+  //
+  // E2E: the relay persists token hashes only, but frame payloads still
+  // transit the DO under TLS termination — a compromised relay would see
+  // prompts/responses. startShare mints an AES-GCM-256 key that ships in
+  // the share URL's #k= fragment (never sent on the wire); E2E-capable
+  // clients (scripts/e2e-shim.mjs) encrypt every payload so the DO pipes
+  // ciphertext — only routing metadata (cid liveness, sizes, timing) is
+  // visible. Stock clients still work in plaintext; mode is per-channel.
+
+  var e2eCids = {}          // cid -> true for /api/e2e-ws channels
+
+  function e2eEncrypt(key, text) {
+    var iv = crypto.getRandomValues(new Uint8Array(12))
+    return crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key,
+      new TextEncoder().encode(text)).then(function (ct) {
+        var out = new Uint8Array(iv.length + ct.byteLength)
+        out.set(iv, 0)
+        out.set(new Uint8Array(ct), iv.length)
+        var bin = '', CH = 0x8000
+        for (var i = 0; i < out.length; i += CH)
+          bin += String.fromCharCode.apply(null, out.subarray(i, i + CH))
+        return btoa(bin)
+      })
+  }
+
+  function e2eDecrypt(key, b64) {
+    var raw = Uint8Array.from(atob(b64), function (c) { return c.charCodeAt(0) })
+    return crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.subarray(0, 12) },
+      key, raw.subarray(12)).then(function (pt) {
+        return new TextDecoder().decode(pt)
+      })
+  }
 
   function shareSend(obj) {
-    if (share && share.ws && share.ws.readyState === 1) {
-      share.ws.send(JSON.stringify(obj))
+    if (!(share && share.ws && share.ws.readyState === 1)) return
+    // E2E channels carry ciphertext payloads only; routing fields (t/cid/id)
+    // stay plaintext — the DO needs them to demux.
+    if (obj.t === 'ws-msg' && e2eCids[obj.cid] && share.key) {
+      e2eEncrypt(share.key, obj.data).then(function (ct) {
+        if (share && share.ws && share.ws.readyState === 1) {
+          share.ws.send(JSON.stringify({ t: 'ws-msg', cid: obj.cid, data: ct }))
+        }
+      })
+      return
     }
+    share.ws.send(JSON.stringify(obj))
+  }
+
+  // Remote REST requests never carry the client's auth — the page
+  // synthesizes the ambient session token + host the local shim injects.
+  function remoteHeaders(h) {
+    var hdrs = Object.assign({}, h)
+    delete hdrs['x-hermes-session-token']
+    delete hdrs['authorization']
+    hdrs['x-hermes-session-token'] = sessionToken
+    hdrs.host = window.location.host
+    return hdrs
   }
 
   function onRelayMessage(ev) {
@@ -749,6 +848,10 @@
       var id = nextId++
       remoteSocks[id] = m.cid
       remoteByCid[m.cid] = id
+      // /api/e2e-ws channels carry AES-GCM ciphertext payloads keyed by the
+      // share fragment — the DO forwarded the client's upgrade path, we
+      // mark the cid and every ws-msg on it crosses as ciphertext.
+      if (m.path === '/api/e2e-ws') e2eCids[m.cid] = true
       // Synthesize the same upgrade the local webapp makes: same session
       // token, same host/origin — upstream's guard sees a stock sidecar.
       postToWorker({
@@ -759,28 +862,53 @@
     } else if (m.t === 'ws-msg' && typeof m.cid === 'string') {
       var lid = remoteByCid[m.cid]
       if (lid === undefined) return
-      trackRpcMethod(lid, m.data)
-      var handled = maybeVaultWrite(m.data, lid)   // remote secret writes -> vault too
-      if (handled) {
-        handled.then(function (rw) { if (rw) postToWorker({ t: 'ws-send', id: lid, data: rw }) })
+      var feed = function (data) {
+        trackRpcMethod(lid, data)
+        var handled = maybeVaultWrite(data, lid)   // remote secret writes -> vault too
+        if (handled) {
+          handled.then(function (rw) { if (rw) postToWorker({ t: 'ws-send', id: lid, data: rw }) })
+        } else {
+          postToWorker({ t: 'ws-send', id: lid, data: data })
+        }
+      }
+      if (e2eCids[m.cid] && share && share.key) {
+        // Wrong-key ciphertext can only produce noise — drop it rather
+        // than feed a plaintext fallback.
+        e2eDecrypt(share.key, m.data).then(feed, function () {})
       } else {
-        postToWorker({ t: 'ws-send', id: lid, data: m.data })
+        feed(m.data)
       }
     } else if (m.t === 'ws-close' && typeof m.cid === 'string') {
       var lid2 = remoteByCid[m.cid]
       if (lid2 === undefined) return
+      delete e2eCids[m.cid]
+      delete sockGrants[lid2]
       postToWorker({ t: 'ws-close', id: lid2, code: m.code, reason: m.reason })
     } else if (m.t === 'rest' && typeof m.id === 'string') {
       var rid = nextId++
+      // E2E REST envelope: POST /api/e2e carries an AES-GCM ciphertext body
+      // decrypting to {method, path, headers, bodyB64}. The DO saw only the
+      // opaque envelope; the reply is re-encrypted before it goes back.
+      if (m.method === 'POST' && /^\/api\/e2e(\?|$)/.test(m.path || '') &&
+          share && share.key) {
+        var relayId = m.id
+        e2eDecrypt(share.key, m.bodyB64 || '').then(function (pt) {
+          var inner = JSON.parse(pt)
+          remoteRest[rid] = { id: relayId, e2e: true }
+          postToWorker({
+            t: 'rest', id: rid, method: inner.method || 'GET',
+            path: inner.path, headers: remoteHeaders(inner.headers),
+            body: inner.bodyB64 ? { b64: inner.bodyB64 } : null,
+          })
+        }, function () {
+          shareSend({ t: 'rest-res', id: relayId, status: 400, headers: {}, bodyB64: '' })
+        })
+        return
+      }
       remoteRest[rid] = m.id
-      var hdrs = Object.assign({}, m.headers)
-      delete hdrs['x-hermes-session-token']
-      delete hdrs['authorization']
-      hdrs['x-hermes-session-token'] = sessionToken
-      hdrs.host = window.location.host
       postToWorker({
         t: 'rest', id: rid, method: m.method || 'GET',
-        path: m.path, headers: hdrs,
+        path: m.path, headers: remoteHeaders(m.headers),
         body: m.bodyB64 ? { b64: m.bodyB64 } : null,
       })
     } else if (m.t === 'end') {
@@ -805,14 +933,30 @@
     }).then(function (meta) {
       // Broker grant the remote sessions sub-scope under — revoking it (via
       // stopShare or the grants UI) locks every remote client out of vault.
-      return vaultCall('createGrant', { kind: 'broker', handles: '*' }).then(function (r) {
+      return vaultCall('createGrant', { kind: 'broker', handles: [] }).then(function (r) {
         return { meta: meta, grant: (r && r.grant) || null }
       })
     }).then(function (m0) {
       var meta = m0.meta
       var wsBase = relayBase.replace(/^http/, 'ws')
       var url = wsBase + '/s/' + meta.sid + '/agent?token=' + encodeURIComponent(meta.agentToken)
-      return import('./vendor/partysocket-ws.js').then(function (mod) {
+      // E2E share key: minted here, exported into the share URL's #k=
+      // fragment — fragments are never transmitted, so the relay never
+      // sees it. E2E-capable clients derive the same key from the URL.
+      var e2eKeyP = crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']
+      ).then(function (k) {
+        return crypto.subtle.exportKey('raw', k).then(function (raw) {
+          var bytes = new Uint8Array(raw), bin = ''
+          for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
+          var b64 = btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+          meta.shareUrl = meta.baseUrl + '?token=' + encodeURIComponent(meta.token) + '#k=' + b64
+          return k
+        })
+      }).catch(function () { return null })
+      return Promise.all([import('./vendor/partysocket-ws.js'), e2eKeyP]).then(function (arr) {
+        var mod = arr[0]
+        var e2eKey = arr[1]
         // partysocket's ReconnectingWebSocket owns retry/backoff/send-queue.
         // Reconnect only on abnormal drops (1006): a clean 1000 is the relay
         // ending or replacing this session — never redial that. Explicit
@@ -822,7 +966,7 @@
           maxRetries: 25,
           shouldReconnectOnClose: function (ev) { return ev.code === 1006 },
         })
-        share = { ws: ws, meta: meta, grant: m0.grant, relayBase: relayBase, state: 'connecting' }
+        share = { ws: ws, meta: meta, grant: m0.grant, relayBase: relayBase, key: e2eKey, state: 'connecting' }
         ws.onmessage = onRelayMessage
         ws.onopen = function () { if (share) { share.state = 'live'; updateShareUI() } }
         ws.onclose = function (ev) {
@@ -830,10 +974,14 @@
           if (ev && ev.code === 1006 && ws.retryCount < 25) {
             // The DO fails all client sockets on agent disconnect; close the
             // corresponding local sidecars so a redial starts clean.
-            for (var lid in remoteSocks) postToWorker({ t: 'ws-close', id: Number(lid), code: 1006, reason: 'relay-drop' })
+            for (var lid in remoteSocks) {
+              postToWorker({ t: 'ws-close', id: Number(lid), code: 1006, reason: 'relay-drop' })
+              delete sockGrants[lid]
+            }
             remoteSocks = {}
             remoteByCid = {}
             remoteRest = {}
+            e2eCids = {}
             share.state = 'reconnecting'
             updateShareUI()
             return
@@ -858,10 +1006,14 @@
         try { s.ws.close(1000, reason || 'stopped') } catch (e) { /* gone */ }
       })
     // Tell the backend every remote socket is gone.
-    for (var lid in remoteSocks) postToWorker({ t: 'ws-close', id: Number(lid), code: 1001, reason: 'share-ended' })
+    for (var lid in remoteSocks) {
+      postToWorker({ t: 'ws-close', id: Number(lid), code: 1001, reason: 'share-ended' })
+      delete sockGrants[lid]
+    }
     remoteSocks = {}
     remoteByCid = {}
     remoteRest = {}
+    e2eCids = {}
     // Revoke the broker grant and every remote sub-grant it minted — any
     // in-flight or future vault resolution by those sessions fails fast.
     if (s.grant) {
@@ -923,9 +1075,10 @@
       ['baseUrl', share.meta.baseUrl],
       ['token', share.meta.token],
     ]
+    if (share.meta.shareUrl) rows.push(['e2e shareUrl', share.meta.shareUrl])
     shareBody.innerHTML = ''
     var hint = document.createElement('p')
-    hint.textContent = 'In Hermes Desktop: Settings → Gateway → remote → paste baseUrl + token.'
+    hint.textContent = 'Desktop: Settings → Gateway → remote → baseUrl + token. For relay-blind E2E (recommended): run `node relay/scripts/e2e-shim.mjs "<shareUrl>"` on the client machine and point it at the shim instead.'
     hint.style.cssText = 'margin:0 0 8px;color:#bbb;font-size:12px'
     shareBody.appendChild(hint)
     rows.forEach(function (r) {

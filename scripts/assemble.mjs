@@ -41,7 +41,7 @@ if (injected === html) {
 }
 writeFileSync(join(out, 'index.html'), injected)
 
-for (const f of ['bootstrap.js', 'backend-worker.mjs', 'vault-worker.mjs', 'local-llm.js', 'pwa-bridge.js', 'host-bridge.js', 'sw.js', 'embed.js', 'embed-peer.js']) {
+for (const f of ['bootstrap.js', 'backend-worker.mjs', 'vault-worker.mjs', 'vault-ops.mjs', 'local-llm.js', 'pwa-bridge.js', 'host-bridge.js', 'sw.js', 'embed.js', 'embed-peer.js']) {
   cpSync(join(root, 'src', f), join(out, f))
 }
 
@@ -57,8 +57,8 @@ cpSync(resolve(root, 'node_modules/penpal/dist/penpal.mjs'),
   join(out, 'vendor', 'penpal.mjs'))
 
 // idb (ISC) — IndexedDB promise wrapper used by pwa-bridge + vault worker.
-cpSync(resolve(root, 'node_modules/idb/build/index.js'),
-  join(out, 'vendor', 'idb.mjs'))
+// Vendored into src/vendor/ so vault-ops.mjs resolves it under plain node too.
+cpSync(resolve(root, 'src/vendor/idb.mjs'), join(out, 'vendor', 'idb.mjs'))
 
 // partysocket (ISC) — reconnecting WebSocket for the relay agent dial.
 cpSync(resolve(root, 'node_modules/partysocket/dist/ws.js'),

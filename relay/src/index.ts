@@ -8,6 +8,8 @@
  *   POST /s                       -> {sid, agentToken, clientToken, baseUrl}
  *   GET  /s/:sid/agent?token=…    -> agent outbound ws dial (one per session)
  *   GET  /s/:sid/api/ws?token=…   -> stock client ws  (clientToken)
+ *   GET  /s/:sid/api/e2e-ws?token=… -> ciphertext-channel client ws (same
+ *                                   token gate; payloads are AES-GCM opaque)
  *   ANY  /s/:sid/api/*            -> stock client REST (X-Hermes-Session-Token
  *                                  or Bearer or ?token=, bridged to the agent)
  *   GET  /s/:sid                  -> status (agent token)

@@ -1,6 +1,9 @@
 .browser-cache/
 dist/
-vendor/
+/vendor/
+# src/vendor/ is tracked — checked-in vendored browser deps (idb.mjs etc.)
+# that vault-ops resolves under plain node for unit tests.
+!src/vendor/
 node_modules/
 .wrangler/
 __pycache__/
