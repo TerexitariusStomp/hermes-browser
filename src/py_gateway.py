@@ -22,6 +22,7 @@ JS contract (js.hermesBridge over coincident's sync proxy):
   wasiRequest(op, argsJson) -> dict       — in-page WASI userspace
   pwaRequest(op, argsJson) -> dict        — browser-grant ops
   hostRequest(op, argsJson) -> dict       — local host-agent substrate
+  nearRequest(op, argsJson, grant) -> dict — NEAR substrate (wallet/x402/intents)
   restReply(id, status, headersJson, bodyB64)
   log(level, msg)
 """
@@ -340,6 +341,29 @@ def host_call(op: str, args: dict | None = None,
     return inner if isinstance(inner, dict) else resp
 
 
+def _turn_grant() -> str:
+    """Broker grant of the session whose prompt-turn thread is running, if
+    any — same attribution fetch_blocking uses for vault scoping."""
+    import threading
+
+    tname = threading.current_thread().name or ""
+    if tname.startswith("prompt-turn-"):
+        return _session_grants.get(tname[len("prompt-turn-"):], "")
+    return ""
+
+
+def near_call(op: str, args: dict | None = None,
+              timeout_s: float = 60.0) -> dict:
+    """In-page NEAR substrate op (near-bridge.js): vault-custodied key
+    signing, policy-enforced sends, x402 paid fetch, intents. The session's
+    broker grant travels with the call so signing stays inside that
+    session's key domain."""
+    resp = _proxy_result(
+        _js().nearRequest(op, json.dumps(args or {}), _turn_grant()))
+    inner = resp.get("result")
+    return inner if isinstance(inner, dict) else resp
+
+
 def install() -> None:
     """Bind the pump router so frames arriving mid-wait get routed."""
     import browser_runtime
@@ -429,6 +453,20 @@ def _install_browser_plugin() -> None:
             "default_model": "qwen2.5-0.5b-instruct-q4_k_m",
             "models": {
                 "qwen2.5-0.5b-instruct-q4_k_m": {"context_length": 4096},
+            },
+        })
+        # NEAR AI Cloud — OpenAI-compatible private inference; Confidential
+        # TEE models run in NEAR's TDX/GPU enclaves (verifiable via the
+        # near_attest tool + cloud.near.ai/verify). BYOK: the API key lives
+        # in the vault like every other provider secret. deepseek-v3.2 is a
+        # 128K-context tool-calling model — above Hermes' 64K floor.
+        providers.setdefault("near-ai-cloud", {
+            "name": "NEAR AI Cloud (Confidential TEE)",
+            "api": "https://cloud-api.near.ai/v1",
+            "default_model": "deepseek/deepseek-v3.2",
+            "models": {
+                "deepseek/deepseek-v3.2": {"context_length": 131072},
+                "qwen/qwen3.5-397b-a17b": {"context_length": 131072},
             },
         })
         terminal = data.setdefault("terminal", {})

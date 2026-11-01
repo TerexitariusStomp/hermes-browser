@@ -41,7 +41,7 @@ if (injected === html) {
 }
 writeFileSync(join(out, 'index.html'), injected)
 
-for (const f of ['bootstrap.js', 'backend-worker.mjs', 'vault-worker.mjs', 'vault-ops.mjs', 'local-llm.js', 'pwa-bridge.js', 'host-bridge.js', 'sw.js', 'embed.js', 'embed-peer.js']) {
+for (const f of ['bootstrap.js', 'backend-worker.mjs', 'vault-worker.mjs', 'vault-ops.mjs', 'local-llm.js', 'pwa-bridge.js', 'host-bridge.js', 'near-bridge.js', 'sw.js', 'embed.js', 'embed-peer.js']) {
   cpSync(join(root, 'src', f), join(out, f))
 }
 
@@ -63,6 +63,31 @@ cpSync(resolve(root, 'src/vendor/idb.mjs'), join(out, 'vendor', 'idb.mjs'))
 // partysocket (ISC) — reconnecting WebSocket for the relay agent dial.
 cpSync(resolve(root, 'node_modules/partysocket/dist/ws.js'),
   join(out, 'vendor', 'partysocket-ws.js'))
+
+// noble-ed25519 (MIT) — vendored into src/vendor/ so vault-ops.mjs resolves
+// it under plain node too (unit tests); fallback signer + import derive.
+cpSync(resolve(root, 'src/vendor/noble-ed25519.mjs'), join(out, 'vendor', 'noble-ed25519.mjs'))
+
+// NEAR SDK bundle (MIT/Apache) — near-api-js + @fastnear/x402 +
+// @fastnear/intents + @a2a-js/sdk client, esbuild-bundled at assemble time
+// so page code never reaches node_modules and CSP script-src 'self' holds.
+try {
+  const { buildSync } = await import('esbuild')
+  buildSync({
+    entryPoints: [resolve(root, 'scripts/near-sdk-entry.mjs')],
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2022',
+    outfile: join(out, 'vendor', 'near-sdk.mjs'),
+    // node builtin used once (util.format) via is-my-json-valid -> near-api-js
+    alias: { util: resolve(root, 'scripts/shims/node-util.mjs') },
+    logLevel: 'warning',
+  })
+  console.log('near-sdk bundle written')
+} catch (e) {
+  console.warn(`near-sdk bundle skipped: ${e.message || e}`)
+}
 
 // Companion host agent (P6/T3 opt-in substrate) — downloadable from the site.
 try {

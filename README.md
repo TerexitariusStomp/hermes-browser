@@ -13,6 +13,44 @@ Access, mic/camera, speech-to-text, wake lock, periodic sync), an in-page
 local-model endpoint, a one-line embed API, and an opt-in localhost
 companion for driving the user's real machine.
 
+## NEAR HACKATHON submission
+
+Tracks: **Privacy & Private AI**, **AI Security & Defense**, **Agent
+Economy**, **Open Innovation**.
+
+Everything above the `pre-hackathon` tag is the in-window submission; the
+browser-runtime agent core is disclosed baseline (built earlier, see
+[the diff](https://github.com/TerexitariusStomp/near-hermes-browser/compare/pre-hackathon...hackathon-submission)).
+Built on NEAR in-window:
+
+- **Agent money the owner controls** (`near` toolset, `src/near-bridge.js`,
+  `src/vault-ops.mjs`): NEAR keys are generated/imported into a vault worker
+  as **non-extractable WebCrypto Ed25519 CryptoKeys** — the agent can sign
+  transactions, NEP-366 delegate actions and NEP-413 messages but can never
+  read the key. Every spend passes a per-session **spending policy** the
+  human approves verbatim: receiver/method allowlists, per-tx and session
+  caps, and a human-confirm threshold. Sessions are separate key domains —
+  a remote/shared session cannot touch another session's keys.
+- **Agent commerce**: `near_pay` runs x402 v2 `exact` on
+  `near:mainnet`/`near:testnet` (NEP-366 delegate + facilitator-settled
+  NEP-141 payment — the agent pays APIs per request); `near_hire_agent`
+  hires listed agents on NEAR Agent Market over A2A+x402 with escrow;
+  `near_intents_*` drives 1Click quotes and deposit settlement.
+- **Private inference, verifiable**: `near-ai-cloud` is a first-class
+  provider (`https://cloud-api.near.ai/v1`, Confidential-TEE models ≥64K
+  ctx); `near_attest` fetches TEE attestation evidence and the public
+  `cloud.near.ai/verify` link — proof, not claims.
+- **Composed from audited OSS** — near-api-js, @fastnear/x402 + @x402/near,
+  @fastnear/intents, @a2a-js/sdk (all MIT/Apache, see `LICENSES.md`); new
+  code is glue only: the vault signer adapter, policy table, tool schemas,
+  consent UI (~1.5k lines vs. ~1M LOC of upstream+deps).
+
+Try it: `npm install && npm run build && npm run serve` →
+http://localhost:8471 → ask the agent "status" → it calls `near_status`,
+proposes a policy, you approve caps in-page, then `near_send` /
+`near_pay` / `near_hire_agent` work inside them. See `SUBMISSION.md` for
+the demo script and judge steps.
+
 ## Requirements
 
 - A cross-origin-isolated host page (`SharedArrayBuffer`/`Atomics` need it):

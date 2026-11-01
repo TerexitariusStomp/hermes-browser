@@ -65,6 +65,12 @@ const bridge = {
     // Opt-in local host substrate (companion host-agent.py on 127.0.0.1).
     return proxy.hostRequest(op, argsJson)
   },
+  nearRequest(op, argsJson, grant) {
+    // In-page NEAR substrate — near-bridge.js composes the vendored SDKs
+    // (near-api-js, @fastnear/x402, @fastnear/intents) behind the vault's
+    // grant-scoped signer and the spending-policy engine.
+    return proxy.nearRequest(op, argsJson, grant || null)
+  },
   log(level, msg) { console.log('[py]', msg) },
 }
 

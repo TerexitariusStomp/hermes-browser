@@ -16,8 +16,14 @@
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {
+    "@a2a-js/sdk": "^1.3.0",
+    "@fastnear/intents": "^2.5.0",
+    "@fastnear/x402": "^2.5.0",
+    "@noble/ed25519": "^3.2.0",
+    "@x402/near": "^2.29.0",
     "coincident": "^4.1.1",
     "idb": "^8.0.3",
+    "near-api-js": "^7.4.0",
     "partysocket": "^1.3.0",
     "penpal": "^7.0.6",
     "pyodide": "0.28.3"

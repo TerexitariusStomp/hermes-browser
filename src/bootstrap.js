@@ -284,6 +284,10 @@
     w.proxy.hostRequest = function (op, argsJson) {
       return withTimeout(hostHandle(op, JSON.parse(argsJson || '{}')), 60000, 'host')
     }
+    w.proxy.nearRequest = function (op, argsJson, grant) {
+      return withTimeout(nearHandle(op, JSON.parse(argsJson || '{}'), grant),
+        120000, 'near')
+    }
   }
 
   import('./vendor/coincident-main.js').then(function (mod) {
@@ -390,6 +394,27 @@
       return m.handle(op, args || {}, {
         vaultCall: vaultCall,
         resolveHeaders: function (h) { return vaultResolveHeaders(h, '') },
+      })
+    }).catch(function (e) {
+      return { error: String(e).slice(0, 300) }
+    })
+  }
+
+  // --- NEAR substrate ------------------------------------------------------
+  // Fixed-op bridge (near-bridge.js): audited SDKs do the protocol work,
+  // the vault worker holds keys and enforces grant scope, the bridge
+  // enforces the owner's spending policy before any signature.
+  var nearMod = null
+
+  function nearHandle(op, args, grant) {
+    var modP = nearMod
+      ? Promise.resolve(nearMod)
+      : import('./near-bridge.js').then(function (m) { nearMod = m; return m })
+    return modP.then(function (m) {
+      return m.handle(op, args || {}, grant || '', {
+        vaultCall: vaultCall,
+        confirm: function (msg) { return Promise.resolve(window.confirm(msg)) },
+        resolveHeaders: function (h, g) { return vaultResolveHeaders(h, g || '') },
       })
     }).catch(function (e) {
       return { error: String(e).slice(0, 300) }
