@@ -16,7 +16,9 @@ companion for driving the user's real machine.
 ## NEAR HACKATHON submission
 
 Tracks: **Privacy & Private AI**, **AI Security & Defense**, **Agent
-Economy**, **Open Innovation**.
+Economy**, **Open Innovation**. Live demo:
+**https://near-hermes-browser.pages.dev** (no install — the agent runs in
+the tab).
 
 Everything above the `pre-hackathon` tag is the in-window submission; the
 browser-runtime agent core is disclosed baseline (built earlier, see

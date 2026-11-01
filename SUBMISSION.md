@@ -90,8 +90,8 @@ returns; show the facilitator-settled transfer.
 
 ## Submission status
 
-- [ ] repo public at https://github.com/TerexitariusStomp/near-hermes-browser
-- [ ] `hackathon-submission` tag pushed
-- [ ] hosted demo URL (Cloudflare Pages)
+- [x] repo public at https://github.com/TerexitariusStomp/near-hermes-browser
+- [x] `hackathon-submission` tag pushed
+- [x] hosted demo: https://near-hermes-browser.pages.dev
 - [ ] demo post published on X (human)
 - [ ] `POST /api/applications` with human-confirmed payload (one-shot)
