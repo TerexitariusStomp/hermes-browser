@@ -472,6 +472,13 @@ def _install_browser_plugin() -> None:
         terminal = data.setdefault("terminal", {})
         if not terminal.get("backend"):
             terminal["backend"] = "wasi"
+        # Default to the keyless in-browser model so first run boots a
+        # working agent instead of gating on a provider sign-in. Judges and
+        # users can switch to near-ai-cloud or any BYOK provider after.
+        model = data.setdefault("model", {})
+        if not model.get("provider"):
+            model["provider"] = "local-llm"
+            model["default"] = "qwen2.5-0.5b-instruct-q4_k_m"
         # HERMES_EXTRA_CONFIG_JSON: JSON object deep-merged into config at
         # boot. Used by smoke tests (mock provider) and deployments that want
         # to ship non-secret defaults.
