@@ -428,6 +428,19 @@
       if (new URL(url).hostname === LOCAL_LLM_HOST) {
         return localLlmFetch(url, method, bodyB64)
       }
+      // Hosts that send no CORS headers (Nous Portal device auth,
+      // inference API) are routed through the same-origin Pages-Function
+      // proxy /proxy/<host>/<rest> so browser fetch never hits CORS.
+      var CORS_PROXY_HOSTS = {
+        'portal.nousresearch.com': 1,
+        'inference-api.nousresearch.com': 1,
+        'welcome-api.nousresearch.com': 1,
+      }
+      var pu = new URL(url)
+      if (CORS_PROXY_HOSTS[pu.hostname] && !pu.hostname.endsWith('.pages.dev')) {
+        url = window.location.origin + '/proxy/' + pu.hostname +
+          pu.pathname + pu.search
+      }
     } catch (e) {}
     var urlTag = url.split('?')[0]
     return withTimeout(
