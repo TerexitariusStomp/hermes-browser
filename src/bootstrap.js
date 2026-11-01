@@ -429,17 +429,16 @@
         return localLlmFetch(url, method, bodyB64)
       }
       // Hosts that send no CORS headers (Nous Portal device auth,
-      // inference API) are routed through the same-origin Pages-Function
-      // proxy /proxy/<host>/<rest> so browser fetch never hits CORS.
+      // inference API) are routed through the allowlisted Cloudflare
+      // Worker proxy so browser fetch never hits CORS.
       var CORS_PROXY_HOSTS = {
         'portal.nousresearch.com': 1,
         'inference-api.nousresearch.com': 1,
         'welcome-api.nousresearch.com': 1,
       }
       var pu = new URL(url)
-      if (CORS_PROXY_HOSTS[pu.hostname] && !pu.hostname.endsWith('.pages.dev')) {
-        url = window.location.origin + '/proxy/' + pu.hostname +
-          pu.pathname + pu.search
+      if (CORS_PROXY_HOSTS[pu.hostname]) {
+        url = CORS_PROXY + pu.hostname + pu.pathname + pu.search
       }
     } catch (e) {}
     var urlTag = url.split('?')[0]
@@ -495,6 +494,9 @@
 
   // --- 5. fetch shim ------------------------------------------------------
   var realFetch = window.fetch
+  // Allowlisted CORS proxy for hosts that send no ACAO (Nous Portal auth,
+  // inference API) — used by both the Python->page path and this shim.
+  var CORS_PROXY = 'https://near-hermes-proxy.widespread.workers.dev/proxy/'
   var CORS_PROXY_HOSTS = {
     'portal.nousresearch.com': 1,
     'inference-api.nousresearch.com': 1,
@@ -508,11 +510,11 @@
     } catch (e) {
       return realFetch.apply(this, arguments)
     }
-    // CORS-deaf hosts (Nous Portal/inference) route through the same-origin
-    // Pages-Function proxy — covers renderer-originated calls, not just the
-    // Python->page fetchRequest path.
+    // CORS-deaf hosts (Nous Portal/inference) route through the allowlisted
+    // Cloudflare Worker proxy — covers renderer-originated calls, not just
+    // the Python->page fetchRequest path.
     if (CORS_PROXY_HOSTS[url.hostname]) {
-      var proxied = origin + '/proxy/' + url.hostname + url.pathname + url.search
+      var proxied = CORS_PROXY + url.hostname + url.pathname + url.search
       if (input instanceof Request) input = new Request(proxied, input)
       else input = proxied
       return realFetch.call(this, input, init)
