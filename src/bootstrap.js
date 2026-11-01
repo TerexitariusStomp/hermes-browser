@@ -495,6 +495,11 @@
 
   // --- 5. fetch shim ------------------------------------------------------
   var realFetch = window.fetch
+  var CORS_PROXY_HOSTS = {
+    'portal.nousresearch.com': 1,
+    'inference-api.nousresearch.com': 1,
+    'welcome-api.nousresearch.com': 1,
+  }
   window.fetch = function (input, init) {
     var url
     try {
@@ -502,6 +507,15 @@
       url = new URL(href, origin)
     } catch (e) {
       return realFetch.apply(this, arguments)
+    }
+    // CORS-deaf hosts (Nous Portal/inference) route through the same-origin
+    // Pages-Function proxy — covers renderer-originated calls, not just the
+    // Python->page fetchRequest path.
+    if (CORS_PROXY_HOSTS[url.hostname]) {
+      var proxied = origin + '/proxy/' + url.hostname + url.pathname + url.search
+      if (input instanceof Request) input = new Request(proxied, input)
+      else input = proxied
+      return realFetch.call(this, input, init)
     }
     if (url.origin !== origin || !url.pathname.startsWith('/api/')) {
       return realFetch.apply(this, arguments)
