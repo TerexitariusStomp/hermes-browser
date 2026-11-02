@@ -450,11 +450,23 @@ def _install_browser_plugin() -> None:
         providers.setdefault("local-llm", {
             "name": "Local (in-browser)",
             "api": "https://local-llm.hermes/v1",
-            "default_model": "qwen2.5-0.5b-instruct-q4_k_m",
+            "default_model": "llama-3.2-1b-instruct-q4_k_m",
             "models": {
-                "qwen2.5-0.5b-instruct-q4_k_m": {"context_length": 4096},
+                # Llama 3.2 natively supports 128K; wllama allocates a
+                # 64K KV cache — above Hermes' 64K floor, bounded in RAM.
+                "llama-3.2-1b-instruct-q4_k_m": {"context_length": 65536},
             },
         })
+        # Migrate homes seeded before the 64K-ctx-capable default: the
+        # qwen2.5-0.5b seed declared a 4K window and could never finish a
+        # turn (Hermes floors at 64K).
+        _llm = providers["local-llm"]
+        _QWEN_SEED = "qwen2.5-0.5b-instruct-q4_k_m"
+        if _llm.get("default_model") == _QWEN_SEED:
+            _llm["default_model"] = "llama-3.2-1b-instruct-q4_k_m"
+            _llm.setdefault("models", {}).pop(_QWEN_SEED, None)
+            _llm["models"]["llama-3.2-1b-instruct-q4_k_m"] = {
+                "context_length": 65536}
         # NEAR AI Cloud — OpenAI-compatible private inference; Confidential
         # TEE models run in NEAR's TDX/GPU enclaves (verifiable via the
         # near_attest tool + cloud.near.ai/verify). BYOK: the API key lives
@@ -478,7 +490,9 @@ def _install_browser_plugin() -> None:
         model = data.setdefault("model", {})
         if not model.get("provider"):
             model["provider"] = "local-llm"
-            model["default"] = "qwen2.5-0.5b-instruct-q4_k_m"
+            model["default"] = "llama-3.2-1b-instruct-q4_k_m"
+        elif model.get("provider") == "local-llm" and model.get("default") == _QWEN_SEED:
+            model["default"] = "llama-3.2-1b-instruct-q4_k_m"
         # HERMES_EXTRA_CONFIG_JSON: JSON object deep-merged into config at
         # boot. Used by smoke tests (mock provider) and deployments that want
         # to ship non-secret defaults.
