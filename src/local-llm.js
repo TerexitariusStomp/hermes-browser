@@ -31,6 +31,7 @@ let loadPromise = null
 let loadState = 'idle' // idle | loading | ready | error
 let loadProgress = null // { loaded, total } during download
 let loadError = null
+let webgpu = false
 
 function json(status, obj, extraHeaders) {
   return {
@@ -163,6 +164,19 @@ async function ensureModel(modelId) {
       wllama = inst
       loadState = 'ready'
       loadProgress = null
+      // wllama passes n_gpu_layers=99999 by default: on WebGPU-capable
+      // browsers (Chrome/Edge/SAFARI TP) the ggml webgpu backend takes the
+      // layers; elsewhere they stay on multithreaded wasm. Surface which
+      // path is live so "is it using my GPU" is answerable — adapter
+      // presence is the honest signal (the API exists without one).
+      webgpu = false
+      try {
+        webgpu = !!(globalThis.navigator && navigator.gpu &&
+          (await navigator.gpu.requestAdapter()))
+      } catch (e) {}
+      console.log('[local-llm] model ready: ' + spec.id + ' n_ctx=' + spec.context_length +
+        ' threads=' + (inst.getNumThreads ? inst.getNumThreads() : '?') +
+        ' webgpu=' + webgpu)
     })()
   }
   try {
@@ -247,6 +261,7 @@ export async function handleRequest(pathname, method, bodyText) {
       progress: loadProgress,
       error: loadError,
       model: wllama ? DEFAULT_MODEL.id : null,
+      webgpu,
     })
   }
   if (method === 'POST' && pathname === '/v1/chat/completions') {
