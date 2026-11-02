@@ -63,17 +63,35 @@ function mockLlm(req, res) {
     let body = ''
     req.on('data', (c) => body += c)
     req.on('end', () => {
-      let echo = ''
+      let echo = '', stream = false, model = 'mock-1'
       try {
-        const msgs = JSON.parse(body).messages || []
+        const parsed = JSON.parse(body)
+        const msgs = parsed.messages || []
         echo = (msgs[msgs.length - 1] && msgs[msgs.length - 1].content) || ''
         if (typeof echo !== 'string') echo = JSON.stringify(echo)
+        stream = !!parsed.stream
+        model = parsed.model || 'mock-1'
       } catch (e) { /* ignore */ }
+      const reply = 'MOCK-LLM-REPLY: ' + echo.slice(0, 200)
+      if (stream) {
+        // Agents call with stream:true — a JSON body reads as an empty SSE
+        // stream and trips upstream's EmptyStreamError.
+        res.setHeader('Content-Type', 'text/event-stream')
+        const chunk = (delta, finish) => 'data: ' + JSON.stringify({
+          id: 'chatcmpl-mock', object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000), model,
+          choices: [{ index: 0, delta, finish_reason: finish }],
+        }) + '\n\n'
+        res.end(
+          chunk({ role: 'assistant', content: reply }, null) +
+          chunk({}, 'stop') + 'data: [DONE]\n\n')
+        return
+      }
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({
         id: 'chatcmpl-mock', object: 'chat.completion', created: Math.floor(Date.now() / 1000),
-        model: 'mock-1',
-        choices: [{ index: 0, message: { role: 'assistant', content: 'MOCK-LLM-REPLY: ' + echo.slice(0, 200) }, finish_reason: 'stop' }],
+        model,
+        choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
       }))
     })
@@ -82,8 +100,59 @@ function mockLlm(req, res) {
   return false
 }
 
+// /proxy/<host>/<rest> — dev parity with dist/_worker.js: forwards to
+// allowlisted CORS-deaf hosts (Nous Portal auth, inference API) so the
+// page can hit them from localhost. Allowlist only — not an open proxy.
+const PROXY_HOSTS = new Set([
+  'portal.nousresearch.com', 'inference-api.nousresearch.com', 'welcome-api.nousresearch.com',
+])
+function corsHeaders(res, origin) {
+  res.setHeader('Access-Control-Allow-Origin', origin || '*')
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS')
+  res.setHeader('Access-Control-Allow-Headers', '*')
+  res.setHeader('x-hermes-proxy', '1')
+}
+function proxyRoute(req, res) {
+  const segs = req.url.split('?')[0].split('/').filter(Boolean)
+  if (segs[0] !== 'proxy') return false
+  corsHeaders(res, req.headers.origin)
+  if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return true }
+  if (!PROXY_HOSTS.has(segs[1])) { res.statusCode = 403; res.end('host not allowed'); return true }
+  const qi = req.url.indexOf('?')
+  const upstream = `https://${segs[1]}/${segs.slice(2).join('/')}${qi >= 0 ? req.url.slice(qi) : ''}`
+  const headers = { ...req.headers }
+  for (const h of ['host', 'origin', 'referer', 'connection', 'keep-alive',
+    'proxy-authenticate', 'proxy-authorization', 'te', 'trailer',
+    'transfer-encoding', 'upgrade', 'x-forwarded-for', 'x-forwarded-proto',
+    'x-real-ip', 'cf-connecting-ip', 'cf-ipcountry', 'cf-ray', 'cf-visitor',
+    'cdn-loop']) delete headers[h]
+  const chunks = []
+  req.on('data', (c) => chunks.push(c))
+  req.on('end', async () => {
+    try {
+      const resp = await fetch(upstream, {
+        method: req.method, headers,
+        body: chunks.length ? Buffer.concat(chunks) : undefined,
+        redirect: 'manual',
+      })
+      res.statusCode = resp.status
+      resp.headers.forEach((v, k) => {
+        if (!['connection', 'keep-alive', 'transfer-encoding', 'content-encoding',
+          'content-length'].includes(k.toLowerCase())) res.setHeader(k, v)
+      })
+      corsHeaders(res, req.headers.origin)
+      res.end(Buffer.from(await resp.arrayBuffer()))
+    } catch (e) {
+      res.statusCode = 502
+      res.end('proxy error: ' + String(e).slice(0, 200))
+    }
+  })
+  return true
+}
+
 createServer((req, res) => {
   if (mockLlm(req, res)) return
+  if (proxyRoute(req, res)) return
   let p = join(ROOT, decodeURIComponent(req.url.split('?')[0]))
   if (p.endsWith('/')) p += 'index.html'
   if (!existsSync(p) || statSync(p).isDirectory()) p = join(ROOT, 'index.html')

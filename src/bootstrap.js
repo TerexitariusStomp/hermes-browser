@@ -307,6 +307,19 @@
       persistHome: true,
       sessionToken: sessionToken,
       publicHost: window.location.hostname,
+      // Deploy-time non-secret config overlay (provider/model defaults for
+      // smoke tests and self-hosts) — deep-merged into config.yaml at boot.
+      extraConfigJson: window.__HERMES_EXTRA_CONFIG__ ||
+        localStorage.getItem('hermes.extraConfigJson') || '',
+      // Non-secret env passthrough for the backend worker (test pins like
+      // HERMES_TUI_TOOLSETS). Set via window.__HERMES_ENV__ or
+      // localStorage['hermes.env'] as JSON.
+      env: (function () {
+        try {
+          return window.__HERMES_ENV__ ||
+            JSON.parse(localStorage.getItem('hermes.env') || '{}')
+        } catch (e) { return {} }
+      })(),
     })
   }).catch(function (e) {
     console.error('[hermes-web] transport init failed:', e)
@@ -496,7 +509,12 @@
   var realFetch = window.fetch
   // Allowlisted CORS proxy for hosts that send no ACAO (Nous Portal auth,
   // inference API) — used by both the Python->page path and this shim.
-  var CORS_PROXY = 'https://near-hermes-proxy.widespread.workers.dev/proxy/'
+  // Default is the same-origin /proxy/ route served by dist/_worker.js on
+  // Pages (and scripts/serve.mjs in dev); deployments without it can point
+  // at a standalone worker via window.__HERMES_CORS_PROXY__ or
+  // localStorage['hermes.corsProxy'] (e.g. 'https://<worker>/proxy/').
+  var CORS_PROXY = window.__HERMES_CORS_PROXY__ ||
+    localStorage.getItem('hermes.corsProxy') || '/proxy/'
   var CORS_PROXY_HOSTS = {
     'portal.nousresearch.com': 1,
     'inference-api.nousresearch.com': 1,

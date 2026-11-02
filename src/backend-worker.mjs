@@ -132,11 +132,13 @@ async function main(msg) {
   }
 
   await pyodide.runPythonAsync(`
-import sys
+import sys, os
 # hermes-env last: the zip contains pure-python stdlib shims (ssl.py etc.)
 # captured from site-packages; they must NOT shadow the wasm stdlib.
 sys.path.append('/hermes-env')
 sys.path.insert(0, '/hermes-py')
+${msg.extraConfigJson ? `os.environ['HERMES_EXTRA_CONFIG_JSON'] = ${JSON.stringify(String(msg.extraConfigJson))}` : ''}
+${(msg.env && typeof msg.env === 'object') ? Object.entries(msg.env).map(([k, v]) => `os.environ[${JSON.stringify(String(k))}] = ${JSON.stringify(String(v))}`).join('\n') : ''}
 import py_gateway
 py_gateway.boot(${JSON.stringify(String(msg.sessionToken || ''))}, ${JSON.stringify(String(msg.publicHost || ''))})
 `)
