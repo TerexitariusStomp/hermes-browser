@@ -250,13 +250,9 @@ async function saveKvState() {
   if (Date.now() - kvLastSave < 60000) return
   kvSaving = (async function () {
     try {
-      // slot assignment is LRU/similarity-based - scan all slots for the
-      // one holding prompt state instead of assuming seq 0
-      var res = null
-      for (var s = 0; s < 4; s++) {
-        var cur = await wllama.proxy.wllamaAction('save_state', { _name: 'svst_req', seq_id: s })
-        if (cur && cur.success && cur.data && (!res || cur.data.byteLength > res.data.byteLength)) res = cur
-      }
+      // seq_id -1 stashes every occupied slot in one pass; the server picks
+      // the largest prompt_cache state
+      var res = await wllama.proxy.wllamaAction('save_state', { _name: 'svst_req', seq_id: -1 })
       if (res && res.success && res.data && res.data.byteLength > 0) {
         await idbPut(kvKey(currentSpec), res.data)
         kvLastSave = Date.now()
@@ -372,7 +368,7 @@ async function chatCompletions(bodyText) {
       sse += 'data: ' + JSON.stringify(chunk) + '\n\n'
     }
     sse += 'data: [DONE]\n\n'
-    saveKvState()
+    await saveKvState()
     return { status: 200, headers: { 'content-type': 'text/event-stream' }, body: sse }
   }
 
@@ -380,11 +376,20 @@ async function chatCompletions(bodyText) {
   try {
     resp = await wllama.createChatCompletion(params)
   } catch (e) {
-    console.log('[local-llm] completion err (' + bodyText.length + 'B req): ' + String(e && e.message || e).slice(0, 160))
-    throw e
+    var msg = String(e && e.message || e)
+    // upstream JSPI flake: a wllama_action response buffer occasionally
+    // comes back without the GLUE header; the retry lands on the same
+    // worker+context and succeeds (matches the agent's own retry).
+    if (/Invalid magic number|typed array length|GLUE/i.test(msg)) {
+      console.log('[local-llm] transient glue err, retrying once: ' + msg.slice(0, 100))
+      resp = await wllama.createChatCompletion(params)
+    } else {
+      console.log('[local-llm] completion err (' + bodyText.length + 'B req): ' + msg.slice(0, 160))
+      throw e
+    }
   }
   resp.model = req.model || DEFAULT_MODEL.id
-  saveKvState()
+  await saveKvState()
   return json(200, resp)
 }
 
