@@ -27,7 +27,7 @@ CHROME="${CHROME:-/home/terex/Documents/hermes-browser/chrome/linux-156.0.8078.8
 # NOTE: profiles live under $HOME — /tmp is a small tmpfs (16G) and large
 # CacheStorage/IndexedDB writes (model weights) die with quota errors there.
 VK_ICD_FILENAMES="$ICD" exec "$CHROME" \
-  --remote-debugging-port=9223 \
+  --remote-debugging-port=${PORT:-9223} \
   --user-data-dir=/home/terex/chrome-profiles/webgpu-$GPU \
   --no-first-run --no-sandbox \
   --ozone-platform=x11 \
