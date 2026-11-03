@@ -1,5 +1,5 @@
 import { chromium } from 'playwright'
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223')
+const browser = await chromium.connectOverCDP('http://127.0.0.1:'+(process.env.CDP_PORT||'9223'))
 const ctx = browser.contexts()[0]
 const page = ctx.pages()[0] || await ctx.newPage()
 page.on('request', r => { if (!r.url().includes('models.dev') && !r.url().includes('nousresearch') && !r.url().includes('githubusercontent')) console.log('REQ', r.url().slice(0,110)) })

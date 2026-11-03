@@ -1,7 +1,7 @@
 // transformers.js WebGPU probe: does ORT WebGPU init on the NVIDIA adapter
 // (no shader-f16) and generate text? Run against the debug-port Chrome.
 import { chromium } from 'playwright-core'
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223', { timeout: 120000 })
+const browser = await chromium.connectOverCDP('http://127.0.0.1:'+(process.env.CDP_PORT||'9223'), { timeout: 120000 })
 const ctx = browser.contexts()[0]
 const page = ctx.pages()[0] || await ctx.newPage()
 if (!page.url().includes('localhost')) await page.goto('http://localhost:8471/', { timeout: 120000 })

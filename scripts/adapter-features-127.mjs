@@ -1,7 +1,7 @@
 // Dump WebGPU adapter info + feature set at page and worker level.
 // Usage: node scripts/adapter-features-127.mjs [url]
 import { chromium } from 'playwright-core'
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223')
+const browser = await chromium.connectOverCDP('http://127.0.0.1:'+(process.env.CDP_PORT||'9223'))
 const ctx = browser.contexts()[0]
 const page = ctx.pages()[0] || await ctx.newPage()
 const url = process.argv[2] || 'http://localhost:8471/'

@@ -1,6 +1,6 @@
 // transformers.js WebGPU speed test on NVIDIA: Llama-3.2-1B q4 (fp32 compute)
 import { chromium } from 'playwright-core'
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9223', { timeout: 120000 })
+const browser = await chromium.connectOverCDP('http://127.0.0.1:'+(process.env.CDP_PORT||'9223'), { timeout: 120000 })
 const ctx = browser.contexts()[0]
 const page = await ctx.newPage()
 await page.goto('http://localhost:8471/', { timeout: 120000 })
