@@ -93,7 +93,7 @@ The vendored tree is never edited — all browser adaptation lives in `src/`.
 | `wasi-runner.mjs` | container2wasm Debian userspace (real `bash`, coreutils) for `terminal`/`process_manage` |
 | `pwa-bridge.js` | Browser-grant capability bridge (Notification, FSA, getUserMedia, Web Speech, WakeLock, periodic-sync) |
 | `host-bridge.js` + `host-agent/host-agent.py` | Opt-in localhost substrate — run `python3 host-agent.py` to let the agent drive your real machine (127.0.0.1 only, token-paired, token vault-held) |
-| `local-llm.js` | In-page local model endpoint (wllama/WebGPU) — agent can run fully offline from any provider |
+| `local-llm.js` | In-page local model endpoint (wllama/WebGPU) — agent can run fully offline from any provider. Ships a **patched wllama wasm** — built from `wllama-src/` (ngxson/wllama@3.6.1 + llama.cpp@83d855c fork) with added `save_state`/`load_state` glue actions that round-trip `server_prompt_cache_state` for KV persistence. A plain `npm install` reverts it; rebuild via `wllama-src/scripts/build_wasm.sh` then copy `esm/index.js` + `esm/wasm/wllama.wasm` into `node_modules/@wllama/wllama/` before assembling. |
 | `embed.js` + `embed-peer.js` | One-line embeddable widget + JSON-RPC bridge, per-origin consent-gated (see `EMBEDDING.md`) |
 | `sw.js` | Service worker (periodic-sync, notifications) |
 
