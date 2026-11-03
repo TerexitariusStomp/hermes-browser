@@ -24,11 +24,15 @@ GPU="${1:-intel}"   # intel | nvidia
 ICD=/usr/share/vulkan/icd.d/${GPU}_icd.x86_64.json
 CHROME="${CHROME:-/home/terex/Documents/hermes-browser/chrome/linux-156.0.8078.80/chrome-linux64/chrome}"
 
+# NOTE: profiles live under $HOME — /tmp is a small tmpfs (16G) and large
+# CacheStorage/IndexedDB writes (model weights) die with quota errors there.
 VK_ICD_FILENAMES="$ICD" exec "$CHROME" \
   --remote-debugging-port=9223 \
-  --user-data-dir=/tmp/pw-webgpu-$GPU \
+  --user-data-dir=/home/terex/chrome-profiles/webgpu-$GPU \
   --no-first-run --no-sandbox \
   --ozone-platform=x11 \
   --enable-unsafe-webgpu \
-  --enable-features=Vulkan \
+  --use-angle=vulkan \
+  --enable-features=Vulkan,VulkanFromANGLE \
+  --enable-webgpu-developer-features \
   "${2:-about:blank}"
