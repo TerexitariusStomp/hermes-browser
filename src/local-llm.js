@@ -216,6 +216,52 @@ var currentSpec = null
 
 function kvKey(spec) { return 'kv:' + spec.id + ':' + spec.sha256.slice(0, 16) }
 
+// At-rest encryption for prompt-bearing state. The KV snapshot and the
+// primed system prompt both encode the conversation prefix — a copied
+// profile or a casual IndexedDB/localStorage inspection must not read them.
+// Key: one AES-GCM-256 CryptoKey generated extractable:false and stored in
+// the same DB. Structured clone moves only the handle — the raw key bytes
+// never exist outside the browser's crypto module, so an exfiltrated
+// profile directory is ciphertext plus an unusable key reference.
+var KV_CRYPTO_KEY = 'key:v1'
+var kvCryptoKeyPromise = null
+
+function kvCryptoKey() {
+  if (!kvCryptoKeyPromise) {
+    kvCryptoKeyPromise = idbGet(KV_CRYPTO_KEY).then(function (k) {
+      if (k) return k
+      return crypto.subtle.generateKey(
+        { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+      ).then(function (k2) {
+        return idbPut(KV_CRYPTO_KEY, k2).then(function () { return k2 })
+      })
+    }).catch(function () { kvCryptoKeyPromise = null; return null })
+  }
+  return kvCryptoKeyPromise
+}
+
+async function encBytes(buf) {
+  var key = await kvCryptoKey()
+  if (!key) return null
+  var iv = crypto.getRandomValues(new Uint8Array(12))
+  var ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, buf))
+  var out = new Uint8Array(12 + ct.byteLength)
+  out.set(iv)
+  out.set(ct, 12)
+  return out
+}
+
+async function decBytes(buf) {
+  var key = await kvCryptoKey()
+  if (!key) return null
+  var u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf)
+  if (u8.byteLength <= 12) return null
+  try {
+    return new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: u8.subarray(0, 12) }, key, u8.subarray(12)))
+  } catch (e) { return null }
+}
+
 function idbOpen() {
   return new Promise(function (resolve, reject) {
     var rq = indexedDB.open(KV_DB, 1)
@@ -254,10 +300,16 @@ async function saveKvState() {
       // the largest prompt_cache state
       var res = await wllama.proxy.wllamaAction('save_state', { _name: 'svst_req', seq_id: -1 })
       if (res && res.success && res.data && res.data.byteLength > 0) {
-        await idbPut(kvKey(currentSpec), res.data)
+        var enc = await encBytes(res.data)
+        if (!enc) {
+          // Fail closed: never write a plaintext snapshot.
+          console.log('[local-llm] KV save skipped: crypto unavailable')
+          return
+        }
+        await idbPut(kvKey(currentSpec), enc)
         kvLastSave = Date.now()
-        console.log('[local-llm] KV snapshot saved: ' +
-          (res.data.byteLength / 1048576).toFixed(0) + 'MB')
+        console.log('[local-llm] KV snapshot saved (encrypted): ' +
+          (enc.byteLength / 1048576).toFixed(0) + 'MB')
       }
     } catch (e) {
       console.log('[local-llm] KV save failed: ' + String(e && e.message || e).slice(0, 120))
@@ -279,10 +331,17 @@ async function restoreKvState() {
       console.log('[local-llm] KV restore: no snapshot in IDB (key=' + kvKey(currentSpec) + ')')
       return false
     }
-    var res = await wllama.proxy.wllamaAction('load_state', { _name: 'ldst_req', seq_id: 0, data: data })
+    var plain = await decBytes(data)
+    if (!plain) {
+      // Pre-encryption snapshots stored the raw state buffer — honor it
+      // once, then the next save rewrites it encrypted.
+      if (data.byteLength > 12) plain = data instanceof Uint8Array ? data : new Uint8Array(data)
+      else return false
+    }
+    var res = await wllama.proxy.wllamaAction('load_state', { _name: 'ldst_req', seq_id: 0, data: plain })
     var ok = !!(res && res.success)
     console.log('[local-llm] KV snapshot ' + (ok ? 'restored' : 'rejected') +
-      ': ' + (data.byteLength / 1048576).toFixed(0) + 'MB')
+      ': ' + (plain.byteLength / 1048576).toFixed(0) + 'MB')
     return ok
   } catch (e) {
     console.log('[local-llm] KV restore failed: ' + String(e && e.message || e).slice(0, 120))
@@ -294,14 +353,34 @@ function savePrime(messages) {
   try {
     var sys = (messages || []).find(function (m) { return m.role === 'system' })
     if (sys && sys.content && sys.content.length > 1000) {
-      localStorage.setItem(PRIME_KEY, sys.content)
+      encBytes(new TextEncoder().encode(sys.content)).then(function (enc) {
+        if (enc) {
+          var s = ''
+          for (var i = 0; i < enc.length; i++) s += String.fromCharCode(enc[i])
+          localStorage.setItem(PRIME_KEY, 'enc:' + btoa(s))
+        }
+      }).catch(function () {})
     }
   } catch (e) {}
 }
 
 async function prime() {
+  var raw = null
+  try { raw = localStorage.getItem(PRIME_KEY) } catch (e) {}
   var sys = null
-  try { sys = localStorage.getItem(PRIME_KEY) } catch (e) {}
+  if (raw && raw.indexOf('enc:') === 0) {
+    try {
+      var bin = atob(raw.slice(4))
+      var enc = new Uint8Array(bin.length)
+      for (var i = 0; i < bin.length; i++) enc[i] = bin.charCodeAt(i)
+      var plain = await decBytes(enc)
+      if (plain) sys = new TextDecoder().decode(plain)
+    } catch (e) {}
+  } else {
+    // Legacy plaintext entry — keep it working, then the next savePrime
+    // rewrites it encrypted.
+    sys = raw
+  }
   if (!sys) return
   console.log('[local-llm] priming KV from saved system prompt (' + sys.length + ' chars)')
   var t0 = Date.now()
