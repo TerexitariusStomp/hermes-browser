@@ -37,6 +37,202 @@
     sessionToken = 'x'.repeat(43)
   }
 
+  // --- 1b. window.hermesDesktop connection-config patch ------------------
+  // The vendored webapp installs its own browser-hosted bridge at module
+  // load. Upstream's bridge throws "Gateway reconfiguration is not available
+  // in the browser-hosted Desktop" on every connection-config write and
+  // reports probes unreachable — so Settings → Gateway can neither save nor
+  // point anywhere. We capture the assignment via a property setter and
+  // patch ONLY the connection-config surface: saves persist to localStorage
+  // (works on every browser incl. old Chrome/Safari — no OPFS or OS keychain
+  // needed) and secrets go to the vault. The in-browser backend keeps
+  // serving /api/* regardless of the configured endpoint — this build never
+  // dials a remote gateway, so "apply" is a persist, not a redial.
+  var CONN_CFG_KEY = 'hermes.connectionConfig'
+  var HOME_FILE_KEY = 'hermes.home:'
+
+  function connCfgRead() {
+    try { return JSON.parse(localStorage.getItem(CONN_CFG_KEY) || '{}') || {} }
+    catch (e) { return {} }
+  }
+
+  function connCfgProfileKey(profile) {
+    return String(profile || '').trim() || 'default'
+  }
+
+  function connCfgView(rec, base) {
+    base = base || {}
+    return {
+      cloudOrg: rec.cloudOrg || '',
+      envOverride: false,
+      mode: rec.mode || 'local',
+      profile: rec.profile || null,
+      remoteAuthMode: rec.remoteAuthMode || 'token',
+      remoteOauthConnected: !!rec.remoteOauthConnected,
+      remoteTokenPlainText: false,
+      remoteTokenPreview: rec.remoteTokenPreview || null,
+      remoteTokenSet: !!rec.remoteTokenSet,
+      remoteUrl: rec.remoteUrl || base.remoteUrl || origin,
+      secureTokenStorage: true, // tokens live in the vault, not plain files
+      sshHost: rec.sshHost || '',
+      sshKeyPath: rec.sshKeyPath || '',
+      sshPort: rec.sshPort || null,
+      sshRemoteHermesPath: rec.sshRemoteHermesPath || '',
+      sshRemoteProfile: rec.sshRemoteProfile || '',
+      sshUser: rec.sshUser || '',
+    }
+  }
+
+  function connCfgSave(payload) {
+    payload = payload || {}
+    var all = connCfgRead()
+    var key = connCfgProfileKey(payload.profile)
+    var prev = all[key] || {}
+    var pick = function (name) {
+      return payload[name] !== undefined ? payload[name] : (prev[name] || '')
+    }
+    var rec = {
+      cloudOrg: pick('cloudOrg'),
+      mode: payload.mode || prev.mode || 'local',
+      profile: payload.profile || null,
+      remoteAuthMode: pick('remoteAuthMode') || 'token',
+      remoteOauthConnected: prev.remoteOauthConnected,
+      remoteTokenHandle: prev.remoteTokenHandle,
+      remoteTokenPreview: prev.remoteTokenPreview,
+      remoteTokenSet: prev.remoteTokenSet,
+      remoteUrl: pick('remoteUrl'),
+      sshHost: pick('sshHost'),
+      sshKeyPath: pick('sshKeyPath'),
+      sshPort: payload.sshPort !== undefined ? payload.sshPort : (prev.sshPort || null),
+      sshRemoteHermesPath: pick('sshRemoteHermesPath'),
+      sshRemoteProfile: pick('sshRemoteProfile'),
+      sshUser: pick('sshUser'),
+    }
+    var finish = function (handle) {
+      if (handle) {
+        rec.remoteTokenHandle = handle
+        rec.remoteTokenSet = true
+        var t = String(payload.remoteToken)
+        rec.remoteTokenPreview = t.slice(0, 3) + '…' + t.slice(-4)
+      }
+      all[key] = rec
+      try { localStorage.setItem(CONN_CFG_KEY, JSON.stringify(all)) }
+      catch (e) { console.warn('[hermes-web] connection config persist failed:', e) }
+      return connCfgView(rec)
+    }
+    // A raw token is a secret: vault it like every other credential write;
+    // only the vault:<handle> + a masked preview reach localStorage.
+    if (typeof payload.remoteToken === 'string' && payload.remoteToken) {
+      return vaultCall('storeSecret', {
+        value: payload.remoteToken, label: 'connection.remoteToken:' + key,
+      }).then(function (resp) {
+        return finish(resp && resp.handle ? 'vault:' + resp.handle : '')
+      }).catch(function () { return finish('') })
+    }
+    if (payload.mode && payload.mode !== 'remote') {
+      rec.remoteTokenSet = false
+      rec.remoteTokenPreview = null
+      rec.remoteTokenHandle = ''
+      rec.remoteOauthConnected = false
+    }
+    return Promise.resolve(finish(''))
+  }
+
+  function sameOriginUrl(u) {
+    try { return new URL(String(u || ''), origin).origin === origin }
+    catch (e) { return false }
+  }
+
+  var REMOTE_UNAVAILABLE =
+    'Remote gateways are unavailable in this in-browser build — ' +
+    'the backend runs on this device.'
+
+  function patchHermesDesktop(b) {
+    if (!b || typeof b !== 'object') return b
+    var origGet = b.getConnectionConfig
+    var origTest = b.testConnectionConfig
+    b.saveConnectionConfig = connCfgSave
+    b.applyConnectionConfig = connCfgSave
+    b.getConnectionConfig = function (profile) {
+      var baseP = origGet ? origGet(profile) : Promise.resolve({})
+      return Promise.resolve(baseP).catch(function () { return {} }).then(function (base) {
+        var rec = connCfgRead()[connCfgProfileKey(profile)]
+        return rec ? connCfgView(rec, base) : base
+      })
+    }
+    b.probeConnectionConfig = function (remoteUrl) {
+      var baseUrl = String(remoteUrl || '')
+      var u
+      try { u = new URL(baseUrl, origin) } catch (e) {
+        return Promise.resolve({
+          authMode: 'unknown', baseUrl: baseUrl, error: 'Invalid URL',
+          providers: [], reachable: false, version: null,
+        })
+      }
+      if (u.origin !== origin) {
+        return Promise.resolve({
+          authMode: 'unknown', baseUrl: u.href, error: REMOTE_UNAVAILABLE,
+          providers: [], reachable: false, version: null,
+        })
+      }
+      // Probe the live in-browser gateway for real — the fetch shim routes
+      // same-origin /api/* to the backend worker.
+      return window.fetch('/api/status', {
+        headers: { 'x-hermes-session-token': sessionToken },
+      }).then(function (resp) {
+        return {
+          authMode: 'token', baseUrl: origin + (BASE_PATH || ''),
+          error: resp.ok ? null : ('Gateway answered ' + resp.status),
+          providers: [], reachable: resp.ok, version: null,
+        }
+      }).catch(function (e) {
+        return {
+          authMode: 'token', baseUrl: origin + (BASE_PATH || ''),
+          error: String(e), providers: [], reachable: false, version: null,
+        }
+      })
+    }
+    b.testConnectionConfig = function (payload) {
+      if (payload && payload.mode === 'remote' && payload.remoteUrl &&
+          !sameOriginUrl(payload.remoteUrl)) {
+        return Promise.resolve({
+          baseUrl: String(payload.remoteUrl), error: REMOTE_UNAVAILABLE,
+          ok: false, reachable: false, version: null,
+        })
+      }
+      if (origTest) return origTest(payload)
+      return Promise.resolve({ baseUrl: origin, ok: true, reachable: true, version: null })
+    }
+    return b
+  }
+
+  try {
+    var _hermesDesktopValue
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      enumerable: true,
+      get: function () { return _hermesDesktopValue },
+      set: function (v) { _hermesDesktopValue = patchHermesDesktop(v) },
+    })
+  } catch (e) { /* ancient engines keep the stock bridge */ }
+
+  // Mirrored ~/.hermes config files (see backend-worker.mjs): on browsers
+  // without OPFS sync-access (old Chrome, old macOS Safari) the Pyodide home
+  // is MEMFS — the worker ships every small config write here and it lands
+  // in localStorage, then ships back in the next boot message.
+  function collectHomeFiles() {
+    var out = []
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i)
+        if (k && k.indexOf(HOME_FILE_KEY) === 0) {
+          out.push({ path: k.slice(HOME_FILE_KEY.length), b64: localStorage.getItem(k) })
+        }
+      }
+    } catch (e) {}
+    return out
+  }
+
   // --- 2. Inbound frame buffer to the backend worker ---------------------
   // The worker pulls: its pump is a sync proxy.pullInbound(ms) call that
   // parks until frames exist or the timeout elapses, then resolves with
@@ -44,8 +240,45 @@
   var inbound = []
   var pullWaiter = null
 
+  // The frontend sends `gateway.ping` JSON-RPC frames every ~15s and kills
+  // the socket when no response lands inside its liveness deadline (~45s).
+  // Upstream answers inside handle_ws on the cooperative loop — but a turn
+  // parks the interpreter inside a synchronous proxy fetch for the whole
+  // generation, so a ping sent mid-turn waits page-side far past that
+  // deadline. The transport (this page <-> worker channel) is what the
+  // heartbeat actually measures, so ack it here. The frame still queues
+  // for the backend: upstream's activity accounting sees it when it
+  // drains, and its id-keyed reply is dropped client-side as a consumed
+  // id — JSON-RPC semantics stay intact.
+  function maybeAckGatewayPing(msg) {
+    var data = msg.data
+    if (typeof data !== 'string' || data.indexOf('ping') === -1) return
+    var req
+    try { req = JSON.parse(data) } catch (e) { return }
+    // Both are upstream's transport-liveness methods, documented as
+    // answered on the WS reader thread even mid-turn — which the
+    // cooperative runtime cannot do, so the page answers for it.
+    var result = req && req.method === 'gateway.ping' ? { ok: true }
+      : req && req.method === 'ping' ? { pong: true }
+      : null
+    if (result === null || req.id === undefined || req.id === null) return
+    var reply = JSON.stringify({ jsonrpc: '2.0', result: result, id: req.id })
+    var cid = remoteSocks[msg.id]
+    if (cid !== undefined) {
+      // Remote client through the share relay — shareSend handles the
+      // e2e ciphertext envelope for /api/e2e-ws channels.
+      shareSend({ t: 'ws-msg', cid: cid, data: reply })
+      return
+    }
+    var sock = sockets[msg.id]
+    if (sock) {
+      sock._onWorkerEvent({ type: 'ws-event', id: msg.id, event: 'message', data: reply })
+    }
+  }
+
   function postToWorker(msg) {
     inbound.push(msg)
+    if (msg.t === 'ws-send') maybeAckGatewayPing(msg)
     if (pullWaiter) {
       var r = pullWaiter
       pullWaiter = null
@@ -288,6 +521,18 @@
       return withTimeout(nearHandle(op, JSON.parse(argsJson || '{}'), grant),
         120000, 'near')
     }
+    w.proxy.persistFile = function (path, b64) {
+      // ~/.hermes config mirror — only small config files get mirrored
+      // (py_gateway whitelists); localStorage keeps them across reloads on
+      // browsers where OPFS can't.
+      try {
+        localStorage.setItem(HOME_FILE_KEY + String(path || ''), String(b64 || ''))
+        return { ok: true }
+      } catch (e) {
+        console.warn('[hermes-web] home mirror write failed:', e)
+        return { error: String(e) }
+      }
+    }
   }
 
   import('./vendor/coincident-main.js').then(function (mod) {
@@ -305,6 +550,7 @@
       envZipUrl: './hermes-env.zip',
       overlayManifestUrl: './overlay/manifest.json',
       persistHome: true,
+      homeFiles: collectHomeFiles(),
       sessionToken: sessionToken,
       publicHost: window.location.hostname,
       // Deploy-time non-secret config overlay (provider/model defaults for

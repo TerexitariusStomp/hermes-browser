@@ -71,6 +71,11 @@ const bridge = {
     // grant-scoped signer and the spending-policy engine.
     return proxy.nearRequest(op, argsJson, grant || null)
   },
+  persistFile(path, b64) {
+    // ~/.hermes config mirror — page writes it to localStorage so settings
+    // survive reloads on hosts without OPFS.
+    return proxy.persistFile(path, b64)
+  },
   log(level, msg) { console.log('[py]', msg) },
 }
 
@@ -120,14 +125,36 @@ async function main(msg) {
   }
 
   // Optional OPFS persistence for ~/.hermes (cross-origin isolated only).
+  let homePersist = 'memfs'
   if (msg.persistHome && pyodide.mountNativeFS) {
     try {
       const root = await navigator.storage.getDirectory()
       const dir = await root.getDirectoryHandle('hermes', { create: true })
       pyodide.FS.mkdirTree('/hermes-home')
       await pyodide.mountNativeFS('/hermes-home', dir)
+      homePersist = 'opfs'
     } catch (e) {
       self.postMessage({ type: 'log', stream: 'err', text: `opfs mount failed: ${e.message}` })
+    }
+  }
+  // No OPFS (old Chrome/Safari, non-isolated contexts): MEMFS is ephemeral,
+  // so seed it from the page's localStorage mirror — py_gateway mirrors
+  // every small config write back out through the same channel.
+  if (msg.persistHome && homePersist !== 'opfs' && Array.isArray(msg.homeFiles)) {
+    for (const f of msg.homeFiles) {
+      try {
+        const rel = String(f && f.path || '')
+        if (!rel || rel.startsWith('/') || rel.split('/').includes('..')) continue
+        const target = `/hermes-home/${rel}`
+        const parent = target.slice(0, target.lastIndexOf('/'))
+        pyodide.FS.mkdirTree(parent)
+        const bin = atob(f.b64 || '')
+        const bytes = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+        pyodide.FS.writeFile(target, bytes)
+      } catch (e) {
+        self.postMessage({ type: 'log', stream: 'err', text: `home mirror restore failed: ${e.message}` })
+      }
     }
   }
 
@@ -140,7 +167,7 @@ sys.path.insert(0, '/hermes-py')
 ${msg.extraConfigJson ? `os.environ['HERMES_EXTRA_CONFIG_JSON'] = ${JSON.stringify(String(msg.extraConfigJson))}` : ''}
 ${(msg.env && typeof msg.env === 'object') ? Object.entries(msg.env).map(([k, v]) => `os.environ[${JSON.stringify(String(k))}] = ${JSON.stringify(String(v))}`).join('\n') : ''}
 import py_gateway
-py_gateway.boot(${JSON.stringify(String(msg.sessionToken || ''))}, ${JSON.stringify(String(msg.publicHost || ''))})
+py_gateway.boot(${JSON.stringify(String(msg.sessionToken || ''))}, ${JSON.stringify(String(msg.publicHost || ''))}, ${msg.persistHome && homePersist !== 'opfs' ? 'True' : 'False'})
 `)
 
   const gw = pyodide.pyimport('py_gateway')

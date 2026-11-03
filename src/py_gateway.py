@@ -81,6 +81,97 @@ _app = None
 _lifespan_cm = None
 _session_token = ""
 _public_host = ""
+_home_mirror = False
+
+# ~/.hermes mirror: on hosts without OPFS the home dir is MEMFS, so small
+# config files are mirrored to the page's localStorage (persistFile bridge)
+# and restored into MEMFS on the next boot. Whitelist keeps it to settings:
+# sessions/history/logs stay out (sqlite is both large and not settings).
+_MIRROR_NAMES = frozenset({
+    "config.yaml", "config.yml", "config.toml",
+    ".env", "settings.json", "plugins.json",
+})
+_MIRROR_EXTS = frozenset({".yaml", ".yml", ".toml", ".ini", ".cfg", ".env"})
+_MIRROR_MAX = 128 * 1024
+
+
+def _mirror_candidate(path) -> str | None:
+    """Repo-relative path under HERMES_HOME if *path* is a mirrorable file."""
+    try:
+        p = os.fspath(path)
+    except Exception:
+        return None
+    home = os.path.realpath(os.environ.get("HERMES_HOME", "/hermes-home"))
+    try:
+        real = os.path.realpath(p)
+    except Exception:
+        real = p
+    if not (real == home or real.startswith(home + os.sep)):
+        return None
+    rel = os.path.relpath(real, home)
+    base = os.path.basename(rel)
+    if base in _MIRROR_NAMES or os.path.splitext(base)[1] in _MIRROR_EXTS:
+        return rel
+    return None
+
+
+def _mirror_file(path) -> None:
+    if not _home_mirror:
+        return
+    rel = _mirror_candidate(path)
+    if rel is None:
+        return
+    try:
+        if os.path.getsize(path) > _MIRROR_MAX:
+            return
+        with open(path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode()
+        _js().persistFile(rel.replace(os.sep, "/"), b64)
+    except Exception:
+        pass  # mirroring is best-effort; never fail a config write over it
+
+
+def _install_home_mirror() -> None:
+    """Mirror sanctioned config writes into page-side localStorage.
+
+    config.yaml flows through hermes_cli.config.atomic_config_write (the one
+    writer upstream mandates); .env and friends land via utils.atomic_replace.
+    config.py binds atomic_replace at import — patch its module local too.
+    """
+    if not _home_mirror:
+        return
+    try:
+        from hermes_cli import config as _cfg
+
+        orig_write = _cfg.atomic_config_write
+
+        def _mirrored_write(config_path, data, **kw):
+            orig_write(config_path, data, **kw)
+            _mirror_file(config_path)
+
+        _cfg.atomic_config_write = _mirrored_write
+    except Exception as e:
+        sys.stderr.write(f"py_gateway: config mirror hook failed: {e}\n")
+    try:
+        import utils as _utils
+
+        orig_replace = _utils.atomic_replace
+
+        def _mirrored_replace(tmp, target, *a, **kw):
+            result = orig_replace(tmp, target, *a, **kw)
+            _mirror_file(target)
+            return result
+
+        _utils.atomic_replace = _mirrored_replace
+        # config.py's top-level `from utils import atomic_replace` froze a
+        # local binding at import — repoint it at the wrapped version.
+        try:
+            from hermes_cli import config as _cfg2
+            _cfg2.atomic_replace = _mirrored_replace
+        except Exception:
+            pass
+    except Exception as e:
+        sys.stderr.write(f"py_gateway: replace mirror hook failed: {e}\n")
 
 
 # --------------------------------------------------------------- socket glue
@@ -551,18 +642,21 @@ def _deep_merge(dst: dict, src: dict) -> dict:
     return dst
 
 
-def boot(session_token: str = "", public_host: str = "") -> None:
+def boot(session_token: str = "", public_host: str = "",
+         mirror_home: bool = False) -> None:
     """Entry called by the worker once the FS is populated."""
-    global _session_token, _public_host
+    global _session_token, _public_host, _home_mirror
     import browser_runtime
     import browser_bootstrap
 
     _session_token = session_token
     _public_host = public_host
+    _home_mirror = mirror_home
     browser_runtime.install()
     browser_bootstrap.install()
     install()
     browser_runtime.get_loop()
+    _install_home_mirror()
     _install_browser_plugin()
     _seed_models_dev_cache()
     import tui_gateway.server as _server  # noqa: F401 — import sanity
