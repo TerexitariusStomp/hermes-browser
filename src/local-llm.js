@@ -177,6 +177,7 @@ async function ensureModel(modelId) {
       console.log('[local-llm] model ready: ' + spec.id + ' n_ctx=' + spec.context_length +
         ' threads=' + (inst.getNumThreads ? inst.getNumThreads() : '?') +
         ' webgpu=' + webgpu)
+      prime()
     })()
   }
   try {
@@ -188,6 +189,43 @@ async function ensureModel(modelId) {
     throw e
   }
   return spec
+}
+
+// KV prime: after the first real request carries the deterministic
+// system prompt through the model, llama.cpp's in-context KV reuse makes
+// turns 2+ instant (measured: ~230ms vs ~93s cold on a 2.4K prefix). We
+// persist that prompt and replay it at next load so the first *user*
+// turn lands on a warm KV instead of paying the ~15min 50K-token
+// prefill up front.
+var PRIME_KEY = 'hermes.localLlm.prime'
+
+function savePrime(messages) {
+  try {
+    var sys = (messages || []).find(function (m) { return m.role === 'system' })
+    if (sys && sys.content && sys.content.length > 1000) {
+      localStorage.setItem(PRIME_KEY, sys.content)
+    }
+  } catch (e) {}
+}
+
+async function prime() {
+  var sys = null
+  try { sys = localStorage.getItem(PRIME_KEY) } catch (e) {}
+  if (!sys) return
+  console.log('[local-llm] priming KV from saved system prompt (' + sys.length + ' chars)')
+  var t0 = Date.now()
+  try {
+    await wllama.createChatCompletion({
+      messages: [
+        { role: 'system', content: sys },
+        { role: 'user', content: 'ok' },
+      ],
+      max_tokens: 1, temperature: 0,
+    })
+    console.log('[local-llm] KV primed in ' + ((Date.now() - t0) / 1000).toFixed(0) + 's')
+  } catch (e) {
+    console.log('[local-llm] prime failed: ' + String(e && e.message || e).slice(0, 120))
+  }
 }
 
 // POST /v1/chat/completions — OpenAI-shaped request in, response out.
@@ -222,6 +260,8 @@ async function chatCompletions(bodyText) {
   if (req.tool_choice) params.tool_choice = req.tool_choice
   if (req.stop) params.stop = req.stop
   if (req.response_format) params.response_format = req.response_format
+
+  savePrime(params.messages)
 
   if (req.stream) {
     var sse = ''
