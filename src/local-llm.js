@@ -162,6 +162,7 @@ async function ensureModel(modelId) {
         cache_type_v: 'q8_0',
       })
       wllama = inst
+      currentSpec = spec
       loadState = 'ready'
       loadProgress = null
       // wllama passes n_gpu_layers=99999 by default: on WebGPU-capable
@@ -177,7 +178,9 @@ async function ensureModel(modelId) {
       console.log('[local-llm] model ready: ' + spec.id + ' n_ctx=' + spec.context_length +
         ' threads=' + (inst.getNumThreads ? inst.getNumThreads() : '?') +
         ' webgpu=' + webgpu)
-      prime()
+      // Restored snapshot makes turn 1 warm immediately; otherwise replay
+      // the saved prompt (still hides the prefill behind boot).
+      if (!(await restoreKvState())) prime()
     })()
   }
   try {
@@ -198,6 +201,98 @@ async function ensureModel(modelId) {
 // turn lands on a warm KV instead of paying the ~15min 50K-token
 // prefill up front.
 var PRIME_KEY = 'hermes.localLlm.prime'
+
+// KV snapshot persistence. The patched wllama wasm exposes
+// llama_state_seq_get_data/set_data via save_state/load_state actions;
+// the snapshot is a pure cache - llama.cpp verifies token prefixes at
+// decode time, so a stale snapshot still yields correct output (it only
+// re-decodes the divergent tail). Unpatched wasm throws "unknown action"
+// and the paths below degrade to the plain prime() replay.
+var KV_DB = 'hermes-local-llm'
+var KV_STORE = 'kv'
+var kvSaving = null
+var kvLastSave = 0
+var currentSpec = null
+
+function kvKey(spec) { return 'kv:' + spec.id + ':' + spec.sha256.slice(0, 16) }
+
+function idbOpen() {
+  return new Promise(function (resolve, reject) {
+    var rq = indexedDB.open(KV_DB, 1)
+    rq.onupgradeneeded = function () { rq.result.createObjectStore(KV_STORE) }
+    rq.onsuccess = function () { resolve(rq.result) }
+    rq.onerror = function () { reject(rq.error) }
+  })
+}
+
+async function idbPut(k, v) {
+  var db = await idbOpen()
+  return new Promise(function (resolve, reject) {
+    var tx = db.transaction(KV_STORE, 'readwrite')
+    tx.objectStore(KV_STORE).put(v, k)
+    tx.oncomplete = function () { resolve() }
+    tx.onerror = function () { reject(tx.error) }
+  })
+}
+
+async function idbGet(k) {
+  var db = await idbOpen()
+  return new Promise(function (resolve, reject) {
+    var rq = db.transaction(KV_STORE).objectStore(KV_STORE).get(k)
+    rq.onsuccess = function () { resolve(rq.result) }
+    rq.onerror = function () { reject(rq.error) }
+  })
+}
+
+async function saveKvState() {
+  if (!wllama || !wllama.proxy || !currentSpec) return
+  if (kvSaving) return kvSaving
+  if (Date.now() - kvLastSave < 60000) return
+  kvSaving = (async function () {
+    try {
+      // slot assignment is LRU/similarity-based - scan all slots for the
+      // one holding prompt state instead of assuming seq 0
+      var res = null
+      for (var s = 0; s < 4; s++) {
+        var cur = await wllama.proxy.wllamaAction('save_state', { _name: 'svst_req', seq_id: s })
+        if (cur && cur.success && cur.data && (!res || cur.data.byteLength > res.data.byteLength)) res = cur
+      }
+      if (res && res.success && res.data && res.data.byteLength > 0) {
+        await idbPut(kvKey(currentSpec), res.data)
+        kvLastSave = Date.now()
+        console.log('[local-llm] KV snapshot saved: ' +
+          (res.data.byteLength / 1048576).toFixed(0) + 'MB')
+      }
+    } catch (e) {
+      console.log('[local-llm] KV save failed: ' + String(e && e.message || e).slice(0, 120))
+    }
+    kvSaving = null
+  })()
+  return kvSaving
+}
+
+async function restoreKvState() {
+  if (!wllama || !wllama.proxy || !currentSpec) {
+    console.log('[local-llm] KV restore skipped: wllama=' + !!wllama +
+      ' proxy=' + !!(wllama && wllama.proxy) + ' spec=' + !!currentSpec)
+    return false
+  }
+  try {
+    var data = await idbGet(kvKey(currentSpec))
+    if (!data || !data.byteLength) {
+      console.log('[local-llm] KV restore: no snapshot in IDB (key=' + kvKey(currentSpec) + ')')
+      return false
+    }
+    var res = await wllama.proxy.wllamaAction('load_state', { _name: 'ldst_req', seq_id: 0, data: data })
+    var ok = !!(res && res.success)
+    console.log('[local-llm] KV snapshot ' + (ok ? 'restored' : 'rejected') +
+      ': ' + (data.byteLength / 1048576).toFixed(0) + 'MB')
+    return ok
+  } catch (e) {
+    console.log('[local-llm] KV restore failed: ' + String(e && e.message || e).slice(0, 120))
+    return false
+  }
+}
 
 function savePrime(messages) {
   try {
@@ -277,6 +372,7 @@ async function chatCompletions(bodyText) {
       sse += 'data: ' + JSON.stringify(chunk) + '\n\n'
     }
     sse += 'data: [DONE]\n\n'
+    saveKvState()
     return { status: 200, headers: { 'content-type': 'text/event-stream' }, body: sse }
   }
 
@@ -288,6 +384,7 @@ async function chatCompletions(bodyText) {
     throw e
   }
   resp.model = req.model || DEFAULT_MODEL.id
+  saveKvState()
   return json(200, resp)
 }
 
