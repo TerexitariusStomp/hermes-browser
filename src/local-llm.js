@@ -160,6 +160,10 @@ async function ensureModel(modelId) {
         // perceptible quality cost for this use.
         cache_type_k: 'q8_0',
         cache_type_v: 'q8_0',
+        // each context checkpoint pins a full copy of the seq KV, so at long
+        // prompts they multiply wasm memory until allocation fails; prefix
+        // reuse works without them
+        n_ctx_checkpoints: 0,
       })
       wllama = inst
       currentSpec = spec
@@ -210,6 +214,7 @@ var PRIME_KEY = 'hermes.localLlm.prime'
 // and the paths below degrade to the plain prime() replay.
 var KV_DB = 'hermes-local-llm'
 var KV_STORE = 'kv'
+var KV_SNAPSHOT_MAX = 600 * 1048576
 var kvSaving = null
 var kvLastSave = 0
 var currentSpec = null
@@ -297,9 +302,19 @@ async function saveKvState() {
   kvSaving = (async function () {
     try {
       // seq_id -1 stashes every occupied slot in one pass; the server picks
-      // the largest prompt_cache state
-      var res = await wllama.proxy.wllamaAction('save_state', { _name: 'svst_req', seq_id: -1 })
+      // the largest prompt_cache state. The timeout matters: if the wasm
+      // worker dies mid-action (oversized state alloc) the promise would
+      // otherwise pend forever and this save hangs every caller.
+      var res = await Promise.race([
+        wllama.proxy.wllamaAction('save_state', { _name: 'svst_req', seq_id: -1 }),
+        new Promise(function (_, rej) { setTimeout(function () { rej(new Error('save_state timeout')) }, 90000) }),
+      ])
       if (res && res.success && res.data && res.data.byteLength > 0) {
+        if (res.data.byteLength > KV_SNAPSHOT_MAX) {
+          console.log('[local-llm] KV save skipped: state ' +
+            (res.data.byteLength / 1048576).toFixed(0) + 'MB over cap')
+          return
+        }
         var enc = await encBytes(res.data)
         if (!enc) {
           // Fail closed: never write a plaintext snapshot.
