@@ -331,6 +331,36 @@ def _log(entry: Dict[str, Any]) -> None:
         pass
 
 
+# ---------- Intentional Hats — scoped authority + stance ----------
+
+def _hat_id(a: Dict[str, Any]) -> str:
+    return a.get("hat_id") or _load_agent().get("hat_id", "")
+
+
+def _t_hat_list(a: Dict[str, Any]) -> str:
+    org = a.get("org") or "2"
+    return _ok(_req("GET", f"/api/hats?org={org}"))
+
+
+def _t_hat_stance(a: Dict[str, Any]) -> str:
+    hat = _hat_id(a)
+    if not hat:
+        return _ok({"error": "no hat_id — set hat_id on the agent or pass it"})
+    if a.get("spec"):
+        return _ok(_req("POST", f"/api/hats/{hat}/stance-check",
+                        {"spec": a["spec"]}))
+    return _ok(_req("GET", f"/api/hats/{hat}"))
+
+
+def _t_hat_work(a: Dict[str, Any]) -> str:
+    """rankOpportunities — funded markets ranked by stance alignment ×
+    reward / estCost. The sim's answer to 'what should I work on?'"""
+    hat = _hat_id(a)
+    if not hat:
+        return _ok({"error": "no hat_id — set hat_id on the agent or pass it"})
+    return _ok(_req("GET", f"/api/hats/{hat}/opportunities"))
+
+
 # ---------- registration ----------
 
 def _s(props: Dict[str, Any], req: list[str], desc: str) -> Dict[str, Any]:
@@ -376,6 +406,17 @@ _SCHEMAS: Dict[str, Dict[str, Any]] = {
         "payer": {"type": "string"}}, ["repo", "seq"],
         "Payer side: accept a claim → triggers adjudication + payout."),
     "wide_ledger": _s({}, [], "Read the local claims→verdicts→receipts ledger."),
+    "hat_list": _s({"org": {"type": "string"}}, [],
+                   "List hats in an Intentional Hats org (role tree, "
+                   "wearers, permissions, stance)."),
+    "hat_stance": _s({
+        "hat_id": {"type": "string"}, "spec": {"type": "string"}}, [],
+        "Show a hat's stance profile, or stance-check a spec: would this "
+        "agent support this work?"),
+    "hat_work": _s({"hat_id": {"type": "string"}}, [],
+                   "Ranked opportunities: funded markets scored by stance "
+                   "alignment × reward / estCost — what this agent should "
+                   "work on first."),
 }
 
 _BINDINGS = {
@@ -383,6 +424,8 @@ _BINDINGS = {
     "wide_agent": _t_agent, "wide_claim": _t_claim, "wide_ship": _t_ship,
     "wide_verdict": _t_verdict, "wide_payout": _t_payout,
     "wide_fund": _t_fund, "wide_accept": _t_accept, "wide_ledger": _t_ledger,
+    "hat_list": _t_hat_list, "hat_stance": _t_hat_stance,
+    "hat_work": _t_hat_work,
 }
 
 # log side-effects for the local ledger
