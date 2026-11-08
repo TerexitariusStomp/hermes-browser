@@ -3,7 +3,7 @@
 # hermes-browser repo is public — `sha` must pin a real 40-hex commit.
 name: hermes-browser
 repo: https://github.com/TerexitariusStomp/hermes-browser
-sha: 261b822f588e78040007b7643c19f2c4ac7949cc
+sha: 9d2f463e42a047aadcf6df89c6db6f9fb8b274ab
 description: Run the stock Hermes agent core entirely inside a browser tab —
   upstream under Pyodide in a Web Worker, secrets held in an isolated vault
   worker (never in the Python heap), WASI userspace terminal, browser-native
