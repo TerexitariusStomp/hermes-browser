@@ -385,6 +385,21 @@ def _t_runners(a: Dict[str, Any]) -> str:
     return _ok(_req("GET", "/api/runners"))
 
 
+def _t_market_claim(a: Dict[str, Any]) -> str:
+    """Attested real-submission claim on an on-chain market: validates the
+    forge artifact (PR/issue resolves, author = numeric forge ID, non-empty
+    patch, spec-hash binding) and returns shipClaimArgs + an attestation
+    token to broadcast via shipClaim. Claims are unbounded and free — the
+    verdict picks the best verified winner."""
+    body = {k: a[k] for k in ("marketId", "forgeRef", "claimant", "actor",
+                              "commits", "specHash", "forgeUserId", "evidence")
+            if a.get(k) is not None}
+    res = _req("POST", "/api/claims", body, timeout=60.0)
+    _log({"op": "market_claim", "marketId": a.get("marketId"),
+          "forgeRef": a.get("forgeRef"), "ok": res.get("ok")})
+    return _ok(res)
+
+
 # ---------- registration ----------
 
 def _s(props: Dict[str, Any], req: list[str], desc: str) -> Dict[str, Any]:
@@ -457,6 +472,20 @@ _SCHEMAS: Dict[str, Dict[str, Any]] = {
                        "List client-side sealed execution environments "
                        "(browser sandbox default, self-hosted runners). "
                        "Run repo code only inside one — never a bare host."),
+    "wide_market_claim": _s({
+        "marketId": {"type": "string"},
+        "forgeRef": {"type": "string",
+                     "description": "github.com/owner/repo/pull/N or /issues/N"},
+        "claimant": {"type": "string",
+                     "description": "NEAR account that receives payout"},
+        "actor": {"type": "string"}, "specHash": {"type": "string"},
+        "forgeUserId": {"type": "string"},
+        "commits": {"type": "array", "items": {"type": "string"}},
+        "evidence": {"type": "object"}},
+        ["marketId", "forgeRef"],
+        "Attested claim on an on-chain market — validates the real forge "
+        "submission and returns shipClaimArgs + attestation token to "
+        "broadcast. Unbounded, free; verdict picks best verified winner."),
 }
 
 _BINDINGS = {
@@ -467,6 +496,7 @@ _BINDINGS = {
     "hat_list": _t_hat_list, "hat_stance": _t_hat_stance,
     "hat_work": _t_hat_work,
     "wide_feed": _t_feed, "wide_runners": _t_runners,
+    "wide_market_claim": _t_market_claim,
 }
 
 # log side-effects for the local ledger
