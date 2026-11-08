@@ -25,6 +25,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict
 
@@ -361,6 +362,29 @@ def _t_hat_work(a: Dict[str, Any]) -> str:
     return _ok(_req("GET", f"/api/hats/{hat}/opportunities"))
 
 
+# ---------- unified forge feed + client-side execution ----------
+
+def _t_feed(a: Dict[str, Any]) -> str:
+    """Query the cross-forge bounty feed — every funded work item on every
+    connected forge, normalized with escrow/verification/trust/competition
+    metadata. Filter by forge/source/repo/q/min_usd/currency/escrow/
+    max_competition; sort by reward|newest|trust."""
+    params = []
+    for k in ("forge", "source", "repo", "q", "min_usd", "currency",
+              "escrow", "sort", "limit", "cursor", "max_competition"):
+        if a.get(k) is not None:
+            params.append(f"{k}={urllib.parse.quote(str(a[k]))}")
+    path = "/api/feed" + ("?" + "&".join(params) if params else "")
+    return _ok(_req("GET", path, timeout=45.0))
+
+
+def _t_runners(a: Dict[str, Any]) -> str:
+    """List client-side sealed execution environments — browser sandbox
+    (default) or self-hosted sealed runners. Run repo code ONLY inside one
+    of these; never on a bare host."""
+    return _ok(_req("GET", "/api/runners"))
+
+
 # ---------- registration ----------
 
 def _s(props: Dict[str, Any], req: list[str], desc: str) -> Dict[str, Any]:
@@ -417,6 +441,22 @@ _SCHEMAS: Dict[str, Dict[str, Any]] = {
                    "Ranked opportunities: funded markets scored by stance "
                    "alignment × reward / estCost — what this agent should "
                    "work on first."),
+    "wide_feed": _s({
+        "forge": {"type": "string"}, "source": {"type": "string"},
+        "repo": {"type": "string"}, "q": {"type": "string"},
+        "min_usd": {"type": "number"}, "currency": {"type": "string"},
+        "escrow": {"type": "string"},
+        "sort": {"type": "string", "enum": ["reward", "newest", "trust"]},
+        "limit": {"type": "integer"}, "cursor": {"type": "string"},
+        "max_competition": {"type": "integer"}}, [],
+        "Search the unified cross-forge bounty feed (JSON+MCP+RSS behind "
+        "it). Every funded work item on every connected forge with "
+        "escrow/verification/trust/competition metadata — pick the best "
+        "bounty, not the first."),
+    "wide_runners": _s({}, [],
+                       "List client-side sealed execution environments "
+                       "(browser sandbox default, self-hosted runners). "
+                       "Run repo code only inside one — never a bare host."),
 }
 
 _BINDINGS = {
@@ -426,6 +466,7 @@ _BINDINGS = {
     "wide_fund": _t_fund, "wide_accept": _t_accept, "wide_ledger": _t_ledger,
     "hat_list": _t_hat_list, "hat_stance": _t_hat_stance,
     "hat_work": _t_hat_work,
+    "wide_feed": _t_feed, "wide_runners": _t_runners,
 }
 
 # log side-effects for the local ledger
