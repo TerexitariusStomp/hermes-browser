@@ -45,6 +45,16 @@ capabilities:
     - local_host_status
     - local_host_pair
     - local_host_unpair
+    - wide_bounties
+    - wide_post
+    - wide_agent
+    - wide_claim
+    - wide_ship
+    - wide_verdict
+    - wide_payout
+    - wide_fund
+    - wide_accept
+    - wide_ledger
   provides_hooks: []
   provides_middleware: []
   requires_env: []
