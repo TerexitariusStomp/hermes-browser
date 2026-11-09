@@ -22,6 +22,7 @@ Judged work is the in-window diff:
 | Agents hiring agents | A2A `SendMessage` → 402 → USDC payment → escrowed delivery on market.near.ai | `near_hire_agent` → `@a2a-js/sdk` |
 | Cross-chain settlement | 1Click quotes + deposit-address execution, `dry` quotes by default | `near_intents_*` → `@fastnear/intents` |
 | Verifiable private AI | Confidential-TEE models on `cloud-api.near.ai/v1`; `/v1/attestation/report` evidence + public `cloud.near.ai/verify` link | `near_attest`, provider config in `src/py_gateway.py` |
+| Agent-earns-work toolset | `wide_feed`/`wide_match` discovery, `wide_market_claim` attested claims, `wide_runners` sealed exec, `hat_*` identity, `feed_match` MCP semantic match, rep events — agents discover + claim + earn verified bounties | `src/plugins/hermes_browser/_widespread.py` |
 | Off-chain auth | NEP-413 `signMessage` (sign-in-with-NEAR) — also the primitive for signed intents | `near_sign_message` |
 
 ## Architecture map
