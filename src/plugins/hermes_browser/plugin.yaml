@@ -2,3 +2,50 @@ name: hermes-browser
 version: "0.1.0"
 description: "Browser-runtime substrates for Hermes running under Pyodide: a browser_ext toolset driving real user-browser tabs through the Hermes substrate extension (grant-gated, audited, fixed ops only), a NEAR toolset for vault-custodied signing and policy-gated spending (x402, intents, A2A hiring, TEE attestation), and a WASI terminal environment backend for in-browser shell execution."
 author: "TerexitariusStomp"
+provides_tools:
+  - browser_ext_click
+  - browser_ext_close_tab
+  - browser_ext_list_tabs
+  - browser_ext_navigate
+  - browser_ext_open_tab
+  - browser_ext_request_grant
+  - browser_ext_screenshot
+  - browser_ext_scroll
+  - browser_ext_snapshot
+  - browser_ext_status
+  - browser_ext_type
+  - local_host_pair
+  - local_host_status
+  - local_host_unpair
+  - near_account
+  - near_agent_card
+  - near_attest
+  - near_delegate
+  - near_hire_agent
+  - near_intents_execute
+  - near_intents_quote
+  - near_intents_status
+  - near_intents_tokens
+  - near_link_account
+  - near_pay
+  - near_policy
+  - near_request_grant
+  - near_send
+  - near_sign_message
+  - near_status
+  - near_transfer
+  - near_view
+  - pwa_bad_response
+  - pwa_fs_forget
+  - pwa_fs_list
+  - pwa_fs_pick_dir
+  - pwa_fs_read
+  - pwa_fs_write
+  - pwa_mic_record
+  - pwa_notify
+  - pwa_periodic_list
+  - pwa_periodic_sync
+  - pwa_status
+  - pwa_stt_listen
+  - pwa_vision_snap
+  - pwa_wakelock

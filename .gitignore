@@ -17,3 +17,4 @@ relay/package-lock.json
 spikes/
 measure-tmp.cjs
 chrome/
+assets/wasi/*.webc

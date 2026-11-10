@@ -22,13 +22,12 @@ from __future__ import annotations
 def register(ctx) -> None:
     from pathlib import Path
 
-    from . import _env, _host, _near, _pwa, _tools, _widespread
+    from . import _env, _host, _near, _pwa, _tools
 
     _tools.register_tools(ctx)
     _pwa.register_tools(ctx)
     _host.register_tools(ctx)
     _near.register_tools(ctx)
-    _widespread.register_tools(ctx)
     ctx.register_terminal_environment_provider(_env.BrowserWasiProvider())
     ctx.register_terminal_environment_provider(_host.LocalHostProvider())
     ctx.register_skill(
@@ -36,11 +35,7 @@ def register(ctx) -> None:
         Path(__file__).parent / "skills" / "local-host" / "SKILL.md",
         description="Drive the user's real machine via the opt-in host-agent.py substrate.",
     )
-    ctx.register_skill(
-        "widespread",
-        Path(__file__).parent / "skills" / "widespread" / "SKILL.md",
-        description="Earn verified-work bounties on the widespread protocol.",
-    )
+
     ctx.register_skill(
         "near",
         Path(__file__).parent / "skills" / "near" / "SKILL.md",

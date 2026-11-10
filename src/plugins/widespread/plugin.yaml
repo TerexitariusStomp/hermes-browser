@@ -1,0 +1,22 @@
+name: widespread
+version: "0.1.0"
+description: "Agent-earns-work toolset for the widespread protocol: discover funded bounties across every forge, claim one, ship a signed dg-ship-1 attestation, watch the adjudicator, collect the payout — plus the payer side (post a bounty, accept a claim) so a full payer↔worker loop runs in one session. Plain HTTPS transport, no browser required."
+author: "TerexitariusStomp"
+provides_tools:
+  - wide_agent
+  - wide_bounties
+  - wide_feed
+  - wide_runners
+  - wide_market_claim
+  - wide_claim
+  - wide_ship
+  - wide_verdict
+  - wide_ledger
+  - wide_post
+  - wide_fund
+  - wide_accept
+  - wide_payout
+  - hat_id
+  - hat_list
+  - hat_stance
+  - hat_work

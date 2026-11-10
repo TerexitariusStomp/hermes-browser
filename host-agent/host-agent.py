@@ -37,14 +37,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 DEFAULT_PORT = 8788
 MAX_TIMEOUT_S = 900
 MAX_OUTPUT = 4 * 1024 * 1024
-STATE_PATH = os.path.expanduser("~/.hermes/host-agent.json")
+def _state_path():
+    try:
+        from hermes_constants import get_hermes_home
+        return os.path.join(str(get_hermes_home()), "host-agent.json")
+    except Exception:
+        return os.path.join(
+            os.environ.get("HERMES_HOST_STATE_DIR",
+                           os.path.expanduser("~/.local/state/hermes-host")),
+            "host-agent.json")
+STATE_PATH = _state_path()
 # Origins allowed to call this agent. Set HERMES_HOST_ORIGINS to a
 # comma-separated list of the HTTPS origins serving your Hermes page, e.g.
 #   HERMES_HOST_ORIGINS="https://hermes.example.com" python3 host-agent.py
 ALLOWED_ORIGINS = {
     o.strip() for o in os.environ.get("HERMES_HOST_ORIGINS", "").split(",") if o.strip()
 }
-ALLOWED_ORIGIN_PREFIXES = ("http://localhost:", "http://127.0.0.1:")
+# CORS is explicit-allowlist only. Origins are exact scheme://host:port
+# strings from HERMES_HOST_ORIGINS; when unset, only the default Hermes
+# page origins are allowed. Blanket localhost-prefix matching is gone —
+# an attacker-origin on another port no longer rides the pairing token.
+DEFAULT_ORIGINS = (
+    "https://hermes.widespread.fyi",
+    "https://app.hermes.network",
+)
+ALLOWED_ORIGINS = ALLOWED_ORIGINS or set(DEFAULT_ORIGINS)
 
 
 def load_or_create_token():
@@ -64,9 +81,7 @@ def load_or_create_token():
 
 
 def origin_allowed(origin):
-    if origin in ALLOWED_ORIGINS:
-        return True
-    return any(origin.startswith(p) for p in ALLOWED_ORIGIN_PREFIXES)
+    return origin in ALLOWED_ORIGINS
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -135,7 +150,14 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isdir(cwd):
             return self._send(400, {"error": f"cwd not found: {cwd}"})
         timeout = min(int(args.get("timeout_s") or 120), MAX_TIMEOUT_S)
-        env = dict(os.environ)
+        # minimal env: PATH, HOME, LANG plus only the variables the
+        # request explicitly names — the agent's full environment
+        # (secrets, tokens, history paths) never leaks into the shell.
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": os.path.expanduser("~"),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
         extra = args.get("env")
         if isinstance(extra, dict):
             env.update({str(k): str(v) for k, v in extra.items()})
