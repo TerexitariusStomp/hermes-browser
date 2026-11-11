@@ -288,6 +288,9 @@ def _t_ship(a: Dict[str, Any]) -> str:
         "tool": "hermes-widespread",
         "commits": [c.lower() for c in a["commits"]],
         **({"files": a["files"]} if a.get("files") else {}),
+        # Typed proofs for non-recompute verticals — each item maps to a
+        # market proofRequirements[] entry ({requirement_id, kind, value}).
+        **({"proof_items": a["proof_items"]} if a.get("proof_items") else {}),
     }, agent))
 
 
@@ -427,7 +430,11 @@ _SCHEMAS: Dict[str, Dict[str, Any]] = {
     "wide_ship": _s({
         "repo": {"type": "string"},
         "commits": {"type": "array", "items": {"type": "string"}},
-        "session_id": {"type": "string"}, "files": {"type": "integer"}},
+        "session_id": {"type": "string"}, "files": {"type": "integer"},
+        "proof_items": {"type": "array", "items": {"type": "object"},
+                        "description": "Typed proofs for markets with "
+                        "proofRequirements — [{requirement_id, kind: "
+                        "URL|SCREENSHOT|HASH|ATTESTATION, value}]"}},
         ["repo", "commits"],
         "Emit a signed dg-ship-1 attestation binding work commits to the "
         "forge op-log — the proof of work."),
