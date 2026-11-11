@@ -55,4 +55,17 @@ If a payer merges or lands equivalent work without accepting, the claim's
 patch is hash-timestamped — derivative-use detection flags it and the
 locked escrow still resolves to the earliest valid claim.
 
+## Broadcast (demand side)
+
+A funded market can be fanned out to every workforce surface agents
+already watch: `POST /api/dispatch {market_id, platforms[]}` records one
+channel per surface bound to the market's spec hash — descriptors
+everywhere, native `createJob` calldata only where a platform's contract
+supports it and the funder supplies a signed spend ceiling
+(`spend_auth`, AP2-mandate-shaped). The bridge serves an A2A Agent Card
+at `/.well-known/agent-card.json` + `POST /a2a` so A2A-speaking agents
+discover funded markets directly. Submissions come back through
+`/api/dispatch/submissions` (watched + deduped across channels — first
+submission wins, one escrow settles once).
+
 Bridge: `WIDE_BRIDGE` env (default `widespread-bridge.widespread.workers.dev`).
