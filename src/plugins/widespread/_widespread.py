@@ -30,6 +30,29 @@ import urllib.request
 from typing import Any, Dict
 
 TOOLSET = "widespread"
+
+def _data_path(name: str) -> str:
+    """Profile-aware plugin data dir: hermes_constants.get_hermes_home()
+    → plugin_db.plugin_data_dir → ~/.hermes fallback. Never a bare
+    hardcoded path — profiles must not share state."""
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+        return os.path.join(str(get_hermes_home()), "plugin-data", TOOLSET, name)
+    except Exception:
+        pass
+    try:
+        from plugin_db import plugin_data_dir  # type: ignore
+        return os.path.join(plugin_data_dir(TOOLSET), name)
+    except Exception:
+        return os.path.expanduser(
+            f"~/.hermes/plugin-data/widespread/{name}")
+
+def _write_secret(path: str, obj) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+
 BRIDGE = os.environ.get(
     "WIDE_BRIDGE", "https://widespread-bridge.widespread.workers.dev"
 ).rstrip("/")
@@ -120,12 +143,7 @@ def _load_agent() -> Dict[str, str]:
     """Ephemeral Ed25519 agent — seed persisted per plugin-data dir; the
     forge assigns the did:key at registration."""
     import secrets
-    try:
-        from plugin_db import plugin_data_dir  # type: ignore
-        path = os.path.join(plugin_data_dir(TOOLSET), "agent.json")
-    except Exception:
-        path = os.path.expanduser(
-            "~/.hermes/plugin-data/widespread/agent.json")
+    path = _data_path("agent.json")
     if os.path.exists(path):
         a = json.load(open(path))
         if "pubkey_hex" not in a:
@@ -221,13 +239,7 @@ def _t_agent(a: Dict[str, Any]) -> str:
                base=FORGE)
     if reg.get("did"):
         agent["did"] = reg["did"]
-        try:
-            from plugin_db import plugin_data_dir  # type: ignore
-            p = os.path.join(plugin_data_dir(TOOLSET), "agent.json")
-        except Exception:
-            p = os.path.expanduser(
-                "~/.hermes/plugin-data/widespread/agent.json")
-        json.dump(agent, open(p, "w"))
+        _write_secret(_data_path("agent.json"), agent)
     return _ok({"did": agent.get("did"), **reg})
 
 
@@ -306,24 +318,14 @@ def _t_accept(a: Dict[str, Any]) -> str:
 
 
 def _t_ledger(a: Dict[str, Any]) -> str:
-    try:
-        from plugin_db import plugin_data_dir  # type: ignore
-        path = os.path.join(plugin_data_dir(TOOLSET), "ledger.jsonl")
-    except Exception:
-        path = os.path.expanduser(
-            "~/.hermes/plugin-data/widespread/ledger.jsonl")
+    path = _data_path("ledger.jsonl")
     if not os.path.exists(path):
         return _ok({"entries": []})
     return _ok({"entries": [json.loads(l) for l in open(path) if l.strip()]})
 
 
 def _log(entry: Dict[str, Any]) -> None:
-    try:
-        from plugin_db import plugin_data_dir  # type: ignore
-        path = os.path.join(plugin_data_dir(TOOLSET), "ledger.jsonl")
-    except Exception:
-        path = os.path.expanduser(
-            "~/.hermes/plugin-data/widespread/ledger.jsonl")
+    path = _data_path("ledger.jsonl")
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a") as f:

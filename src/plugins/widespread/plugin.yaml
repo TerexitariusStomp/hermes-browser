@@ -16,7 +16,8 @@ provides_tools:
   - wide_fund
   - wide_accept
   - wide_payout
-  - hat_id
   - hat_list
   - hat_stance
   - hat_work
+provides_hooks:
+  - pre_tool_call
