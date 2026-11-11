@@ -1,4 +1,4 @@
-"""Unit tests for src/plugins/hermes_browser/_widespread.py.
+"""Unit tests for src/plugins/widespread/_widespread.py.
 
 Runs under plain CPython unittest — no Pyodide, no pytest, no network.
 Covers the dependency-free parts of the plugin: the RFC 8032 Ed25519
@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent
-                     / "src" / "plugins" / "hermes_browser"))
+                     / "src" / "plugins" / "widespread"))
 import _widespread as w  # noqa: E402
 
 
