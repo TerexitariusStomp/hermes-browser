@@ -50,6 +50,7 @@ def _data_path(name: str) -> str:
 def _write_secret(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # O_TRUNC keeps an existing file's old mode
     with os.fdopen(fd, "w") as f:
         json.dump(obj, f)
 
@@ -145,11 +146,15 @@ def _load_agent() -> Dict[str, str]:
     import secrets
     path = _data_path("agent.json")
     if os.path.exists(path):
+        try:
+            os.chmod(path, 0o600)  # tighten files written before 0600 mode
+        except OSError:
+            pass
         a = json.load(open(path))
         if "pubkey_hex" not in a:
             a["pubkey_hex"] = _pubkey(base64.b64decode(a["seed_b64"])).hex()
             a.setdefault("did", None)
-            json.dump(a, open(path, "w"))
+            _write_secret(path, a)
         return a
     seed = secrets.token_bytes(32)
     agent = {
@@ -157,8 +162,7 @@ def _load_agent() -> Dict[str, str]:
         "pubkey_hex": _pubkey(seed).hex(),
         "did": None,
     }
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    json.dump(agent, open(path, "w"))
+    _write_secret(path, agent)
     return agent
 
 

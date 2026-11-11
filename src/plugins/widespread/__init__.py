@@ -36,14 +36,21 @@ def _pre_tool_call(*, tool_name: str = "", args: Optional[Dict[str, Any]] = None
     if reason is None:
         return None
     detail = ""
+    band = ""
     if isinstance(args, dict):
         bits = [f"{k}={v}" for k, v in args.items()
                 if k in ("repo", "amount_usd", "seq", "payer", "spec")]
         if bits:
             detail = " — " + ", ".join(str(b)[:60] for b in bits)
+        if "amount_usd" in args:
+            try:
+                amt = float(args["amount_usd"])
+                band = ".le10" if amt <= 10 else ".le100" if amt <= 100 else ".gt100"
+            except (TypeError, ValueError):
+                pass
     return {"action": "approve",
             "message": f"wide: {reason}{detail}",
-            "rule_key": f"widespread.{tool_name}"}
+            "rule_key": f"widespread.{tool_name}{band}"}
 
 
 def register(ctx) -> None:
