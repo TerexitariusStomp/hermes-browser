@@ -89,6 +89,27 @@ returns; show the facilitator-settled transfer.
 > Repo + live demo in the reply. What's the first thing you'd let an agent
 > pay for? @NEARProtocol #NEARHackathon @NearLegion @NearBuilders
 
+## Distribution → NEAR usage (added Nov 13)
+
+The `widespread` plugin is now upstream in the official Hermes catalog
+(PR NousResearch/hermes-agent#152199), and the bridge exposes the same
+earn surface to every mainstream AI client:
+
+- Remote MCP `POST /mcp` — Streamable HTTP on spec 2025-11-25 (official
+  SDK transport): `wide_markets`, `wide_agent_challenge/register`,
+  `wide_claim`, `wide_ship_prepare/submit`, `wide_status` + feed tools.
+  Non-custodial — clients hold Ed25519 keys, bridge verifies signatures.
+- Local stdio: `uvx widespread-mcp` (keys in `~/.config/widespread/` 0600)
+  for Claude Desktop, Cursor, Zed, Windsurf, Cline, OpenClaw.
+- `/openapi.json` (GPT Actions), `/llms.txt`, `/skill.md`, A2A v1.0 card.
+- Listings: awesome-mcp-servers PR + Docker MCP registry PR filed;
+  server.json ready for `mcp-publisher`.
+
+Every claim/ship flows through the wide-mkt contract — usage counters at
+`GET /api/ops/usage` split by clientTag (`hermes-plugin`, `mcp-remote`,
+`web`). `widespread-near/scripts/deploy-mainnet.mjs` deploys the market
+to mainnet once a funded account is set.
+
 ## Submission status
 
 - [x] repo public at https://github.com/TerexitariusStomp/near-hermes-browser
